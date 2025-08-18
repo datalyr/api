@@ -1,0 +1,39 @@
+{
+  "name": "@datalyr/api",
+  "version": "1.0.1",
+  "description": "Datalyr API SDK for server-side tracking",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "node tests/test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "datalyr",
+    "analytics",
+    "tracking",
+    "attribution",
+    "server-side",
+    "node"
+  ],
+  "author": "Datalyr",
+  "license": "MIT",
+  "homepage": "https://datalyr.com",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "@datalyr/api",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Datalyr API SDK for server-side tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -27,6 +27,13 @@
   "author": "Datalyr",
   "license": "MIT",
   "homepage": "https://datalyr.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/datalyr/api.git"
+  },
+  "bugs": {
+    "url": "https://github.com/datalyr/api/issues"
+  },
   "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.0.0",

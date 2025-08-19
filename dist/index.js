@@ -79,7 +79,7 @@ var Datalyr = class {
       properties: properties || {},
       context: {
         library: "@datalyr/api",
-        version: "1.0.0"
+        version: "1.0.3"
       },
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     };

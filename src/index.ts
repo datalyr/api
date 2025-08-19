@@ -92,7 +92,7 @@ export class Datalyr {
       properties: properties || {},
       context: {
         library: '@datalyr/api',
-        version: '1.0.0'
+        version: '1.0.3'
       },
       timestamp: new Date().toISOString()
     };

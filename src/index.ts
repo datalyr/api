@@ -92,7 +92,8 @@ export class Datalyr {
       properties: properties || {},
       context: {
         library: '@datalyr/api',
-        version: '1.0.3'
+        version: '1.0.4',
+        source: 'api'  // Explicitly set source for server-side API
       },
       timestamp: new Date().toISOString()
     };

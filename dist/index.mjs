@@ -54,7 +54,9 @@ var Datalyr = class {
       properties: properties || {},
       context: {
         library: "@datalyr/api",
-        version: "1.0.3"
+        version: "1.0.4",
+        source: "api"
+        // Explicitly set source for server-side API
       },
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     };

@@ -1,6 +1,6 @@
 {
   "name": "@datalyr/api",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Datalyr API SDK for server-side tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

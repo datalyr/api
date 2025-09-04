@@ -1,5 +1,6 @@
 // src/index.ts
 var Datalyr = class {
+  // Persistent anonymous ID for identity resolution
   constructor(config) {
     this.queue = [];
     this.isFlushing = false;
@@ -37,21 +38,41 @@ var Datalyr = class {
     if (this.maxQueueSize > 1e4) this.maxQueueSize = 1e4;
     this.startFlushTimer();
   }
-  async track(userId, event, properties) {
+  async track(userIdOrOptions, event, properties) {
     if (this.isClosing) {
       if (this.debug) {
-        console.warn("[Datalyr] SDK is closing, event dropped:", event);
+        console.warn("[Datalyr] SDK is closing, event dropped");
       }
       return;
     }
-    if (!event || typeof event !== "string") {
+    let userId;
+    let eventName;
+    let eventProperties;
+    let providedAnonymousId;
+    if (typeof userIdOrOptions === "object" && userIdOrOptions !== null) {
+      userId = userIdOrOptions.userId;
+      eventName = userIdOrOptions.event;
+      eventProperties = userIdOrOptions.properties || {};
+      providedAnonymousId = userIdOrOptions.anonymousId;
+    } else {
+      userId = userIdOrOptions || void 0;
+      eventName = event;
+      eventProperties = properties || {};
+    }
+    if (!eventName || typeof eventName !== "string") {
       throw new Error("Event name is required and must be a string");
     }
+    const anonymousId = providedAnonymousId || this.getOrCreateAnonymousId();
+    const enrichedProperties = {
+      ...eventProperties,
+      anonymous_id: anonymousId
+    };
     const trackEvent = {
       userId: userId || void 0,
-      anonymousId: userId ? void 0 : this.generateAnonymousId(),
-      event,
-      properties: properties || {},
+      anonymousId,
+      // Always include for identity resolution
+      event: eventName,
+      properties: enrichedProperties,
       context: {
         library: "@datalyr/api",
         version: "1.0.4",
@@ -66,7 +87,10 @@ var Datalyr = class {
     if (!userId) {
       throw new Error("userId is required for identify");
     }
-    return this.track(userId, "$identify", { $set: traits });
+    return this.track(userId, "$identify", {
+      $set: traits,
+      anonymous_id: this.getOrCreateAnonymousId()
+    });
   }
   async page(userId, name, properties) {
     return this.track(userId, "$pageview", { name, ...properties });
@@ -193,6 +217,15 @@ var Datalyr = class {
   }
   generateAnonymousId() {
     return "anon_" + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  }
+  getOrCreateAnonymousId() {
+    if (!this.anonymousId) {
+      this.anonymousId = this.generateAnonymousId();
+    }
+    return this.anonymousId;
+  }
+  getAnonymousId() {
+    return this.getOrCreateAnonymousId();
   }
   // Cleanup
   async close() {

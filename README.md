@@ -1,6 +1,6 @@
 # @datalyr/api
 
-Official API SDK for Datalyr server-side tracking.
+Official API SDK for Datalyr server-side tracking with identity resolution support.
 
 ## Installation
 
@@ -51,6 +51,57 @@ await datalyr.group('user_123', 'company_456', {
 // Clean up when done
 await datalyr.close();
 ```
+
+## Identity Resolution (New in v1.1.0)
+
+The SDK now supports anonymous IDs for complete user journey tracking:
+
+```javascript
+// Option 1: Pass anonymous_id from browser/mobile for attribution preservation
+await datalyr.track({
+  event: 'Purchase Completed',
+  userId: 'user_123',
+  anonymousId: req.body.anonymous_id,  // From browser/mobile SDK
+  properties: {
+    amount: 99.99,
+    currency: 'USD'
+  }
+});
+
+// Option 2: Use legacy signature (SDK generates anonymous_id)
+await datalyr.track('user_123', 'Purchase Completed', {
+  amount: 99.99
+});
+
+// Get the SDK's anonymous ID (useful for server-only tracking)
+const anonymousId = datalyr.getAnonymousId();
+```
+
+### Express.js Example with Browser Attribution
+
+```javascript
+app.post('/api/purchase', async (req, res) => {
+  const { items, anonymous_id } = req.body;  // anonymous_id from browser
+  
+  // Track with anonymous_id to preserve attribution (fbclid, gclid, etc.)
+  await datalyr.track({
+    event: 'Purchase Completed',
+    userId: req.user?.id,
+    anonymousId: anonymous_id,  // Links to browser events!
+    properties: {
+      total: calculateTotal(items),
+      items: items.length
+    }
+  });
+  
+  res.json({ success: true });
+});
+```
+
+### Key Benefits:
+- **Attribution Preservation**: Never lose fbclid, gclid, ttclid, or lyr tracking
+- **Complete Journey**: Track users from web → server → mobile
+- **Flexible API**: Support both legacy and new tracking methods
 
 ## Configuration
 

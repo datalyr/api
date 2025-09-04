@@ -18,6 +18,13 @@ export interface TrackEvent {
   timestamp?: string;
 }
 
+export interface TrackOptions {
+  userId?: string;
+  anonymousId?: string;
+  event: string;
+  properties?: Record<string, any>;
+}
+
 export class Datalyr {
   private apiKey: string;
   private host: string;
@@ -31,6 +38,7 @@ export class Datalyr {
   private timer?: NodeJS.Timeout;
   private isFlushing: boolean = false;
   private isClosing: boolean = false;
+  private anonymousId?: string;  // Persistent anonymous ID for identity resolution
 
   constructor(config: DatalyrConfig | string) {
     if (typeof config === 'string') {
@@ -73,23 +81,54 @@ export class Datalyr {
     this.startFlushTimer();
   }
 
-  async track(userId: string | null, event: string, properties?: any): Promise<void> {
+  // Overloaded track method that accepts TrackOptions
+  async track(options: TrackOptions): Promise<void>;
+  async track(userId: string | null, event: string, properties?: any): Promise<void>;
+  async track(userIdOrOptions: string | null | TrackOptions, event?: string, properties?: any): Promise<void> {
     if (this.isClosing) {
       if (this.debug) {
-        console.warn('[Datalyr] SDK is closing, event dropped:', event);
+        console.warn('[Datalyr] SDK is closing, event dropped');
       }
       return;
     }
 
-    if (!event || typeof event !== 'string') {
+    // Handle both signatures
+    let userId: string | undefined;
+    let eventName: string;
+    let eventProperties: any;
+    let providedAnonymousId: string | undefined;
+
+    if (typeof userIdOrOptions === 'object' && userIdOrOptions !== null) {
+      // TrackOptions signature
+      userId = userIdOrOptions.userId;
+      eventName = userIdOrOptions.event;
+      eventProperties = userIdOrOptions.properties || {};
+      providedAnonymousId = userIdOrOptions.anonymousId;
+    } else {
+      // Legacy signature: (userId, event, properties)
+      userId = userIdOrOptions || undefined;
+      eventName = event!;
+      eventProperties = properties || {};
+    }
+
+    if (!eventName || typeof eventName !== 'string') {
       throw new Error('Event name is required and must be a string');
     }
 
+    // Use provided anonymousId or generate one
+    const anonymousId = providedAnonymousId || this.getOrCreateAnonymousId();
+    
+    // Include anonymous_id in properties for attribution
+    const enrichedProperties = {
+      ...eventProperties,
+      anonymous_id: anonymousId
+    };
+
     const trackEvent: TrackEvent = {
       userId: userId || undefined,
-      anonymousId: userId ? undefined : this.generateAnonymousId(),
-      event,
-      properties: properties || {},
+      anonymousId: anonymousId,  // Always include for identity resolution
+      event: eventName,
+      properties: enrichedProperties,
       context: {
         library: '@datalyr/api',
         version: '1.0.4',
@@ -105,7 +144,11 @@ export class Datalyr {
     if (!userId) {
       throw new Error('userId is required for identify');
     }
-    return this.track(userId, '$identify', { $set: traits });
+    // Track $identify event for identity resolution
+    return this.track(userId, '$identify', { 
+      $set: traits,
+      anonymous_id: this.getOrCreateAnonymousId()
+    });
   }
 
   async page(userId: string, name?: string, properties?: any): Promise<void> {
@@ -271,6 +314,17 @@ export class Datalyr {
 
   private generateAnonymousId(): string {
     return 'anon_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  }
+
+  private getOrCreateAnonymousId(): string {
+    if (!this.anonymousId) {
+      this.anonymousId = this.generateAnonymousId();
+    }
+    return this.anonymousId;
+  }
+
+  getAnonymousId(): string {
+    return this.getOrCreateAnonymousId();
   }
 
   // Cleanup

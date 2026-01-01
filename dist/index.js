@@ -100,7 +100,7 @@ var Datalyr = class {
       properties: enrichedProperties,
       context: {
         library: "@datalyr/api",
-        version: "1.0.4",
+        version: "1.1.0",
         source: "api"
         // Explicitly set source for server-side API
       },

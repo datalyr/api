@@ -1,194 +1,390 @@
 # @datalyr/api
 
-Official API SDK for Datalyr server-side tracking with identity resolution support.
+Server-side analytics and attribution SDK for Node.js. Track events, identify users, and preserve attribution data from your backend.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Configuration](#configuration)
+- [Event Tracking](#event-tracking)
+  - [Custom Events](#custom-events)
+  - [Page Views](#page-views)
+- [User Identity](#user-identity)
+  - [Anonymous ID](#anonymous-id)
+  - [Identifying Users](#identifying-users)
+  - [Groups](#groups)
+- [Attribution Preservation](#attribution-preservation)
+- [Event Queue](#event-queue)
+- [Framework Examples](#framework-examples)
+  - [Express.js](#expressjs)
+  - [Stripe Webhooks](#stripe-webhooks)
+- [TypeScript](#typescript)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
 
 ## Installation
 
 ```bash
 npm install @datalyr/api
-# or
-yarn add @datalyr/api
-# or
-pnpm add @datalyr/api
 ```
+
+---
 
 ## Quick Start
 
 ```javascript
-const { Datalyr } = require('@datalyr/api');
-// or
 import { Datalyr } from '@datalyr/api';
 
-// Initialize with your API key
-const datalyr = new Datalyr('your_api_key_here');
+// Initialize
+const datalyr = new Datalyr('dk_your_api_key');
 
-// Track an event
-await datalyr.track('user_123', 'Purchase Completed', {
-  amount: 99.99,
-  currency: 'USD',
-  products: ['item_1', 'item_2']
-});
+// Track events
+await datalyr.track('user_123', 'button_clicked', { button: 'signup' });
 
-// Identify a user
-await datalyr.identify('user_123', {
-  email: 'user@example.com',
-  name: 'John Doe',
-  plan: 'premium'
-});
+// Identify users
+await datalyr.identify('user_123', { email: 'user@example.com' });
 
-// Track a pageview
-await datalyr.page('user_123', 'Homepage', {
-  url: 'https://example.com',
-  referrer: 'https://google.com'
-});
-
-// Group a user
-await datalyr.group('user_123', 'company_456', {
-  name: 'Acme Corp',
-  industry: 'Technology'
-});
-
-// Clean up when done
+// Clean up on shutdown
 await datalyr.close();
 ```
 
-## Identity Resolution (New in v1.1.0)
+---
 
-The SDK now supports anonymous IDs for complete user journey tracking:
+## How It Works
 
-```javascript
-// Option 1: Pass anonymous_id from browser/mobile for attribution preservation
-await datalyr.track({
-  event: 'Purchase Completed',
-  userId: 'user_123',
-  anonymousId: req.body.anonymous_id,  // From browser/mobile SDK
-  properties: {
-    amount: 99.99,
-    currency: 'USD'
-  }
-});
+The SDK collects events and sends them to the Datalyr backend for analytics and attribution.
 
-// Option 2: Use legacy signature (SDK generates anonymous_id)
-await datalyr.track('user_123', 'Purchase Completed', {
-  amount: 99.99
-});
+### Data Flow
 
-// Get the SDK's anonymous ID (useful for server-only tracking)
-const anonymousId = datalyr.getAnonymousId();
-```
+1. Events are created with `track()`, `identify()`, `page()`, or `group()`
+2. Events are queued locally and sent in batches
+3. Batches are sent when queue reaches 20 events or every 10 seconds
+4. Failed requests are retried with exponential backoff
+5. Events are processed server-side for analytics and attribution reporting
 
-### Express.js Example with Browser Attribution
+### Event Payload
+
+Every event includes:
 
 ```javascript
-app.post('/api/purchase', async (req, res) => {
-  const { items, anonymous_id } = req.body;  // anonymous_id from browser
-  
-  // Track with anonymous_id to preserve attribution (fbclid, gclid, etc.)
-  await datalyr.track({
-    event: 'Purchase Completed',
-    userId: req.user?.id,
-    anonymousId: anonymous_id,  // Links to browser events!
-    properties: {
-      total: calculateTotal(items),
-      items: items.length
-    }
-  });
-  
-  res.json({ success: true });
-});
+{
+  event: 'purchase',              // Event name
+  properties: { ... },            // Custom properties
+
+  // Identity
+  anonymous_id: 'uuid',           // Persistent ID
+  user_id: 'user_123',            // Set after identify()
+
+  // Timestamps
+  timestamp: '2024-01-15T10:30:00Z',
+}
 ```
 
-### Key Benefits:
-- **Attribution Preservation**: Never lose fbclid, gclid, ttclid, or lyr tracking
-- **Complete Journey**: Track users from web → server → mobile
-- **Flexible API**: Support both legacy and new tracking methods
+---
 
 ## Configuration
 
 ```javascript
 const datalyr = new Datalyr({
-  apiKey: 'your_api_key_here',
-  host: 'https://api.datalyr.com',  // Optional: custom host
-  flushAt: 20,                      // Optional: batch size (default: 20)
-  flushInterval: 10000,             // Optional: batch interval in ms (default: 10000)
-  debug: true,                      // Optional: enable debug logging (default: false)
-  timeout: 10000,                   // Optional: request timeout in ms (default: 10000)
-  retryLimit: 3,                    // Optional: max retries (default: 3)
-  maxQueueSize: 1000                // Optional: max events in queue (default: 1000)
+  // Required
+  apiKey: string,
+
+  // Optional
+  host?: string,              // Custom endpoint (default: https://ingest.datalyr.com)
+  flushAt?: number,           // Batch size (default: 20)
+  flushInterval?: number,     // Send interval ms (default: 10000)
+  timeout?: number,           // Request timeout ms (default: 10000)
+  retryLimit?: number,        // Max retries (default: 3)
+  maxQueueSize?: number,      // Max queued events (default: 1000)
+  debug?: boolean,            // Console logging (default: false)
 });
 ```
 
-## Stripe Webhook Example
+---
+
+## Event Tracking
+
+### Custom Events
+
+Track any action in your application:
 
 ```javascript
-const { Datalyr } = require('@datalyr/api');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+// Simple event
+await datalyr.track('user_123', 'signup_started');
 
-const datalyr = new Datalyr(process.env.DATALYR_API_KEY);
+// Event with properties
+await datalyr.track('user_123', 'product_viewed', {
+  product_id: 'SKU123',
+  product_name: 'Blue Shirt',
+  price: 29.99,
+  currency: 'USD',
+});
+
+// Purchase event
+await datalyr.track('user_123', 'Purchase Completed', {
+  order_id: 'ORD-456',
+  total: 99.99,
+  currency: 'USD',
+  items: ['SKU123', 'SKU456'],
+});
+```
+
+### Page Views
+
+Track server-rendered page views:
+
+```javascript
+await datalyr.page('user_123', 'Homepage', {
+  url: 'https://example.com',
+  referrer: 'https://google.com',
+});
+
+await datalyr.page('user_123', 'Product Details', {
+  url: 'https://example.com/products/123',
+  product_id: 'SKU123',
+});
+```
+
+---
+
+## User Identity
+
+### Anonymous ID
+
+The SDK generates a persistent anonymous ID:
+
+```javascript
+const anonymousId = datalyr.getAnonymousId();
+// 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+```
+
+For attribution preservation, pass the anonymous ID from your browser/mobile SDK instead.
+
+### Identifying Users
+
+Link events to a known user:
+
+```javascript
+await datalyr.identify('user_123', {
+  email: 'user@example.com',
+  name: 'John Doe',
+  plan: 'premium',
+});
+```
+
+### Groups
+
+Associate users with companies or teams:
+
+```javascript
+await datalyr.group('user_123', 'company_456', {
+  name: 'Acme Corp',
+  industry: 'Technology',
+  employees: 50,
+});
+```
+
+---
+
+## Attribution Preservation
+
+Pass the anonymous ID from browser/mobile SDKs to preserve attribution data:
+
+```javascript
+// Object signature with anonymousId
+await datalyr.track({
+  event: 'Purchase Completed',
+  userId: 'user_123',
+  anonymousId: req.body.anonymous_id,  // From browser SDK
+  properties: {
+    amount: 99.99,
+    currency: 'USD',
+  },
+});
+```
+
+This links server-side events to the user's browser session, preserving:
+- UTM parameters (utm_source, utm_medium, utm_campaign)
+- Click IDs (fbclid, gclid, ttclid)
+- Referrer and landing page
+- Customer journey touchpoints
+
+---
+
+## Event Queue
+
+Events are batched for efficiency.
+
+### Configuration
+
+```javascript
+const datalyr = new Datalyr({
+  apiKey: 'dk_your_api_key',
+  flushAt: 20,           // Send when 20 events queued
+  flushInterval: 10000,  // Or every 10 seconds
+});
+```
+
+### Manual Flush
+
+Send all queued events immediately:
+
+```javascript
+await datalyr.flush();
+```
+
+### Graceful Shutdown
+
+Always close the client on application shutdown:
+
+```javascript
+process.on('SIGTERM', async () => {
+  await datalyr.close();  // Flushes remaining events
+  process.exit(0);
+});
+```
+
+---
+
+## Framework Examples
+
+### Express.js
+
+```javascript
+import express from 'express';
+import { Datalyr } from '@datalyr/api';
+
+const app = express();
+const datalyr = new Datalyr('dk_your_api_key');
+
+app.post('/api/purchase', async (req, res) => {
+  const { items, anonymous_id } = req.body;
+
+  // Track with anonymous_id to preserve attribution
+  await datalyr.track({
+    event: 'Purchase Completed',
+    userId: req.user?.id,
+    anonymousId: anonymous_id,
+    properties: {
+      total: calculateTotal(items),
+      item_count: items.length,
+    },
+  });
+
+  res.json({ success: true });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  await datalyr.close();
+  process.exit(0);
+});
+```
+
+### Stripe Webhooks
+
+```javascript
+import { Datalyr } from '@datalyr/api';
+import Stripe from 'stripe';
+
+const datalyr = new Datalyr('dk_your_api_key');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.post('/webhooks/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  
+
   switch (event.type) {
     case 'checkout.session.completed':
+      const session = event.data.object;
       await datalyr.track(
-        event.data.object.client_reference_id,
+        session.client_reference_id,
         'Purchase Completed',
         {
-          amount: event.data.object.amount_total / 100,
-          currency: event.data.object.currency,
-          stripeSessionId: event.data.object.id
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          stripe_session_id: session.id,
         }
       );
       break;
-      
+
     case 'customer.subscription.created':
+      const subscription = event.data.object;
       await datalyr.track(
-        event.data.object.metadata.userId,
+        subscription.metadata.userId,
         'Subscription Started',
         {
-          plan: event.data.object.items.data[0].price.nickname,
-          mrr: event.data.object.items.data[0].price.unit_amount / 100,
-          interval: event.data.object.items.data[0].price.recurring.interval
+          plan: subscription.items.data[0].price.nickname,
+          mrr: subscription.items.data[0].price.unit_amount / 100,
+          interval: subscription.items.data[0].price.recurring.interval,
         }
       );
       break;
   }
-  
+
   res.json({ received: true });
 });
 ```
 
-## API Reference
+---
 
-### `new Datalyr(config)`
+## TypeScript
 
-Creates a new Datalyr instance.
+```typescript
+import { Datalyr, TrackOptions, IdentifyOptions } from '@datalyr/api';
 
-### `track(userId, event, properties?)`
+const datalyr = new Datalyr('dk_your_api_key');
 
-Track a custom event.
+// Type-safe tracking
+const trackOptions: TrackOptions = {
+  event: 'Purchase Completed',
+  userId: 'user_123',
+  anonymousId: 'anon_456',
+  properties: {
+    amount: 99.99,
+    currency: 'USD',
+  },
+};
 
-### `identify(userId, traits?)`
+await datalyr.track(trackOptions);
+```
 
-Identify a user with traits.
+---
 
-### `page(userId, name?, properties?)`
+## Troubleshooting
 
-Track a pageview.
+### Events not appearing
 
-### `group(userId, groupId, traits?)`
+1. Check API key starts with `dk_`
+2. Enable `debug: true`
+3. Call `flush()` to force send
+4. Check server logs for errors
 
-Associate a user with a group.
+### Request timeouts
 
-### `flush()`
+```javascript
+const datalyr = new Datalyr({
+  apiKey: 'dk_your_api_key',
+  timeout: 30000,     // Increase timeout
+  retryLimit: 5,      // More retries
+});
+```
 
-Manually flush the event queue.
+### Queue full
 
-### `close()`
+```javascript
+const datalyr = new Datalyr({
+  apiKey: 'dk_your_api_key',
+  maxQueueSize: 5000,   // Increase queue size
+  flushAt: 50,          // Larger batches
+});
+```
 
-Flush remaining events and clean up resources.
+---
 
 ## License
 

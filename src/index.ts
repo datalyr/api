@@ -12,6 +12,7 @@ export interface DatalyrConfig {
 export interface TrackEvent {
   userId?: string;
   anonymousId?: string;
+  eventId?: string;
   event: string;
   properties?: Record<string, any>;
   context?: Record<string, any>;
@@ -24,6 +25,16 @@ export interface TrackOptions {
   event: string;
   properties?: Record<string, any>;
 }
+
+function generateEventId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for older Node.js versions
+  return 'evt_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
+const SDK_VERSION = '1.2.3';
 
 export class Datalyr {
   private apiKey: string;
@@ -117,7 +128,7 @@ export class Datalyr {
 
     // Use provided anonymousId or generate one
     const anonymousId = providedAnonymousId || this.getOrCreateAnonymousId();
-    
+
     // Include anonymous_id in properties for attribution
     const enrichedProperties = {
       ...eventProperties,
@@ -127,12 +138,13 @@ export class Datalyr {
     const trackEvent: TrackEvent = {
       userId: userId || undefined,
       anonymousId: anonymousId,  // Always include for identity resolution
+      eventId: generateEventId(),
       event: eventName,
       properties: enrichedProperties,
       context: {
         library: '@datalyr/api',
-        version: '1.2.1',
-        source: 'api'  // Explicitly set source for server-side API
+        version: SDK_VERSION,
+        source: 'api'
       },
       timestamp: new Date().toISOString()
     };
@@ -144,9 +156,21 @@ export class Datalyr {
     if (!userId) {
       throw new Error('userId is required for identify');
     }
-    // Track $identify event for identity resolution
-    return this.track(userId, '$identify', { 
-      $set: traits,
+    // Track $identify event — spread traits flat (not wrapped in $set)
+    // so the user-properties-updater can extract email, name, etc.
+    return this.track(userId, '$identify', {
+      ...traits,
+      anonymous_id: this.getOrCreateAnonymousId()
+    });
+  }
+
+  async alias(newUserId: string, previousId?: string): Promise<void> {
+    if (!newUserId) {
+      throw new Error('newUserId is required for alias');
+    }
+    return this.track(newUserId, '$alias', {
+      new_user_id: newUserId,
+      previous_id: previousId || this.getOrCreateAnonymousId(),
       anonymous_id: this.getOrCreateAnonymousId()
     });
   }
@@ -159,7 +183,7 @@ export class Datalyr {
     if (!groupId) {
       throw new Error('groupId is required for group');
     }
-    return this.track(userId, '$group', { groupId, traits });
+    return this.track(userId, '$group', { groupId, ...traits });
   }
 
   private enqueue(event: TrackEvent): void {
@@ -207,17 +231,17 @@ export class Datalyr {
       // Send events in parallel batches for better performance
       const batchSize = 10;
       const errors: Error[] = [];
-      
+
       for (let i = 0; i < events.length; i += batchSize) {
         const batch = events.slice(i, i + batchSize);
-        const promises = batch.map(event => 
+        const promises = batch.map(event =>
           this.sendEvent(event).catch(err => {
             errors.push(err);
             // Re-queue failed event at the front
             this.queue.unshift(event);
           })
         );
-        
+
         await Promise.allSettled(promises);
       }
 
@@ -238,7 +262,8 @@ export class Datalyr {
         method: 'POST',
         headers: {
           'X-API-Key': this.apiKey,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'User-Agent': `@datalyr/api/${SDK_VERSION}`
         },
         body: JSON.stringify(event),
         signal: controller.signal
@@ -253,12 +278,12 @@ export class Datalyr {
         } catch {
           // Ignore body read errors
         }
-        
+
         // Don't retry on 4xx errors (client errors)
         if (response.status >= 400 && response.status < 500) {
           throw new Error(`Client error: ${response.status} ${response.statusText} - ${errorText}`);
         }
-        
+
         // Retry on 5xx errors (server errors)
         throw new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
       }
@@ -290,7 +315,7 @@ export class Datalyr {
         await new Promise(resolve => setTimeout(resolve, backoffMs));
         return this.sendEvent(event, retryCount + 1);
       }
-      
+
       throw error;
     }
   }
@@ -330,20 +355,20 @@ export class Datalyr {
   // Cleanup
   async close(): Promise<void> {
     this.isClosing = true;
-    
+
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    
+
     // Final flush with timeout
     const flushPromise = this.flush();
-    const timeoutPromise = new Promise<void>((resolve) => 
+    const timeoutPromise = new Promise<void>((resolve) =>
       setTimeout(() => resolve(), 5000)
     );
-    
+
     await Promise.race([flushPromise, timeoutPromise]);
-    
+
     if (this.debug && this.queue.length > 0) {
       console.warn(`[Datalyr] Closing with ${this.queue.length} events still queued`);
     }

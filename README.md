@@ -112,6 +112,22 @@ await datalyr.page('user_123', 'Pricing', {
 });
 ```
 
+### alias()
+
+```javascript
+await datalyr.alias(newUserId: string, previousId?: string);
+```
+
+Link a new user ID to a previous one (e.g., after account merge). If `previousId` is omitted, the current anonymous ID is used. Internally sends a `$alias` event.
+
+```javascript
+// Link new ID to the current anonymous user
+await datalyr.alias('new_user_456');
+
+// Or specify the previous ID explicitly
+await datalyr.alias('new_user_456', 'old_user_123');
+```
+
 ### group()
 
 ```javascript

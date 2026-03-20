@@ -40,7 +40,7 @@ The constructor accepts a `DatalyrConfig` object or an API key string.
 // Config object
 const datalyr = new Datalyr({
   apiKey: 'dk_...',           // Required. Must start with "dk_".
-  host: 'https://api.datalyr.com',  // API endpoint (default: 'https://api.datalyr.com')
+  host: 'https://ingest.datalyr.com/track',  // API endpoint (default: 'https://ingest.datalyr.com/track')
   flushAt: 20,                // Flush when queue reaches this size (default: 20, range: 1-100)
   flushInterval: 10000,       // Flush timer interval in ms (default: 10000)
   debug: false,               // Log events and errors to console (default: false)

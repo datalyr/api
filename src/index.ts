@@ -43,7 +43,7 @@ export class Datalyr {
   constructor(config: DatalyrConfig | string) {
     if (typeof config === 'string') {
       this.apiKey = config;
-      this.host = 'https://api.datalyr.com';
+      this.host = 'https://ingest.datalyr.com/track';
       this.debug = false;
       this.flushAt = 20;
       this.flushInterval = 10000;
@@ -52,7 +52,7 @@ export class Datalyr {
       this.maxQueueSize = 1000;
     } else {
       this.apiKey = config.apiKey;
-      this.host = config.host || 'https://api.datalyr.com';
+      this.host = config.host || 'https://ingest.datalyr.com/track';
       this.debug = config.debug || false;
       this.flushAt = config.flushAt || 20;
       this.flushInterval = config.flushInterval || 10000;

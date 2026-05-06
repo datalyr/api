@@ -223,7 +223,7 @@ await datalyr.track({
 });
 ```
 
-This preserves UTM parameters, click IDs (gclid, fbclid, ttclid), referrer, landing page, and the full customer journey.
+This preserves UTM parameters, click IDs (gclid, fbclid, ttclid, oppref), referrer, landing page, and the full customer journey.
 
 ## Framework Examples
 

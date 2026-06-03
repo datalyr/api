@@ -1,6 +1,6 @@
 {
   "name": "@datalyr/api",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "description": "Datalyr API SDK for server-side tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
-    "test": "node tests/test.js",
+    "test": "node tests/test.ts",
     "prepublishOnly": "npm run build"
   },
   "files": [
@@ -41,6 +41,6 @@
     "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=14.17.0"
   }
 }

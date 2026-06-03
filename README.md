@@ -165,10 +165,26 @@ process.on('SIGTERM', async () => {
 
 ### getAnonymousId()
 
-Returns the SDK instance's persistent anonymous ID. The ID is generated lazily on first use and has the format `anon_<random><timestamp>` (e.g., `anon_k7x2m9f1lxyzabc`).
+Generates and returns a **new** anonymous ID each call, format `anon_<uuid>` (e.g.
+`anon_3d5cf66d-203f-4009-8bb0-f3714da152a4`). It is **not** a stable per-instance value.
+
+> **Server-side identity (important).** This SDK runs in a multi-user process, so it does
+> NOT keep one shared anonymous ID — that would merge distinct end-users into a single
+> identity. Persist an anonymous/session ID **in your own per-user store** (e.g. from the
+> visitor's browser/mobile SDK or your session) and pass it back as `anonymousId` on each
+> call to stitch that user's events:
+>
+> ```javascript
+> datalyr.track({ userId: 'user_123', anonymousId: session.anonymousId, event: 'Purchase' });
+> datalyr.identify('user_123', { email }, session.anonymousId);
+> ```
+>
+> Calls without a `userId` or `anonymousId` get a fresh anonymous ID and can't be stitched
+> across calls (a one-time warning is logged). `identify`/`alias`/`page`/`group` all accept
+> an `anonymousId` as their last argument.
 
 ```javascript
-const anonId = datalyr.getAnonymousId();
+const anonId = datalyr.getAnonymousId(); // a fresh id — persist it yourself, pass back as anonymousId
 ```
 
 ## Event Payload
@@ -178,15 +194,15 @@ Every event sent to the API has this structure:
 ```javascript
 {
   event: 'Purchase Completed',
-  userId: 'user_123',              // undefined if not provided
-  anonymousId: 'anon_k7x2m9f...',  // Always present
+  userId: 'user_123',                              // undefined if not provided
+  anonymousId: 'anon_3d5cf66d-203f-4009-...',      // provided id, else a fresh one per call
   properties: {
     amount: 99.99,
-    anonymous_id: 'anon_k7x2m9f...',  // Automatically added
+    anonymous_id: 'anon_3d5cf66d-203f-4009-...',   // automatically added (mirrors anonymousId)
   },
   context: {
     library: '@datalyr/api',
-    version: '1.2.1',
+    version: '1.3.0',
     source: 'api',
   },
   timestamp: '2025-01-15T10:30:00.000Z',
@@ -200,13 +216,15 @@ Notes:
 
 ## Batching and Retry Behavior
 
-Events are queued locally and sent in batches, not one at a time.
+Events are queued locally and flushed with up to 10 requests in flight at once — a
+concurrency window, **not** a single batched request (one POST per event).
 
 - **Auto-flush triggers:** when the queue reaches `flushAt` events, or every `flushInterval` ms.
-- **Batch size:** events are sent in parallel batches of 10 within a single flush.
-- **Queue overflow:** when the queue reaches `maxQueueSize`, the oldest event is dropped to make room.
-- **Retry:** 5xx (server) errors are retried up to `retryLimit` times with exponential backoff (1s, 2s, 4s, ... capped at 10s). 4xx (client) errors are permanent failures and are not retried.
-- **Failed events:** events that fail after all retries are re-queued at the front.
+- **Concurrency:** up to 10 events are sent in parallel within a single flush.
+- **Queue overflow:** when the queue reaches `maxQueueSize`, the oldest event is dropped to make room (a warning is logged once).
+- **Retry:** 5xx (server) errors are retried up to `retryLimit` times with jittered exponential backoff (≈1s, 2s, 4s, … capped at 10s). 4xx (client) errors are permanent failures and are not retried.
+- **Failed events:** re-queued at the front and retried on later flushes; dropped (with a warning) after repeated failed flush cycles so one permanently-failing event can't block the queue.
+- **Shutdown:** `await close()` keeps flushing until the queue drains or `closeTimeout` (default 30s) expires.
 
 ## Attribution Preservation
 

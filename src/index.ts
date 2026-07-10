@@ -30,6 +30,16 @@ export interface TrackOptions {
   anonymousId?: string;
   event: string;
   properties?: Record<string, any>;
+  /** Idempotency key for this event. The ingest server de-duplicates on it (6h window),
+   *  so pass a stable id from your source system — e.g. the Stripe webhook `event.id` —
+   *  and at-least-once webhook redeliveries won't double-count. Must be a non-empty
+   *  string; anything else is ignored (a random UUID is generated, as when omitted). */
+  eventId?: string;
+  /** When the event actually happened. Accepts an ISO-8601 string, a Date, or a numeric
+   *  epoch (milliseconds; values < 1e12 are interpreted as epoch SECONDS, e.g. Stripe's
+   *  `event.created`). Defaults to now. Invalid values are ignored (defaults to now) —
+   *  pass this on delayed webhook replays so the event lands on the right day. */
+  timestamp?: string | Date | number;
 }
 
 // NODE-13: use node:crypto randomUUID unconditionally (GA since Node 14.17). The old
@@ -162,6 +172,8 @@ export class Datalyr {
     let eventName: string;
     let eventProperties: any;
     let providedAnonymousId: string | undefined;
+    let providedEventId: string | undefined;
+    let providedTimestamp: string | Date | number | undefined;
 
     if (typeof userIdOrOptions === 'object' && userIdOrOptions !== null) {
       // TrackOptions signature
@@ -169,6 +181,8 @@ export class Datalyr {
       eventName = userIdOrOptions.event;
       eventProperties = userIdOrOptions.properties || {};
       providedAnonymousId = userIdOrOptions.anonymousId;
+      providedEventId = userIdOrOptions.eventId;
+      providedTimestamp = userIdOrOptions.timestamp;
     } else {
       // Legacy signature: (userId, event, properties)
       userId = userIdOrOptions || undefined;
@@ -199,7 +213,11 @@ export class Datalyr {
     const trackEvent: TrackEvent = {
       userId: userId || undefined,
       anonymousId: anonymousId,  // Always include for identity resolution
-      eventId: generateEventId(),
+      // 9.D.1: honor a caller-supplied eventId VERBATIM — it is the ingest server's dedup
+      // key (6h window), so webhook handlers can pass the source event id (e.g. Stripe
+      // `event.id`) and at-least-once redeliveries no longer double-count revenue. A fresh
+      // uuid per call (the old unconditional behavior) made every redelivery look new.
+      eventId: this.resolveEventId(providedEventId),
       event: eventName,
       properties: enrichedProperties,
       context: {
@@ -207,7 +225,9 @@ export class Datalyr {
         version: SDK_VERSION,
         source: 'api'
       },
-      timestamp: new Date().toISOString()
+      // 9.D.5: honor a caller-supplied timestamp (ingest reads `event.timestamp || now`),
+      // so delayed webhook replays land on the day the event happened, not the replay day.
+      timestamp: this.resolveTimestamp(providedTimestamp)
     };
 
     this.enqueue(trackEvent);
@@ -251,6 +271,43 @@ export class Datalyr {
       throw new Error('groupId is required for group');
     }
     return this.track({ userId, anonymousId, event: '$group', properties: { groupId, ...traits } });
+  }
+
+  // 9.D.1: caller-supplied idempotency key. Defensive by design — this SDK must never
+  // crash the host — so anything that isn't a non-empty string is IGNORED (fresh uuid,
+  // same as omitting it) with a debug warning, never a throw.
+  private resolveEventId(provided: unknown): string {
+    if (typeof provided === 'string' && provided.trim().length > 0) {
+      return provided; // verbatim — must match exactly across redeliveries to dedup
+    }
+    if (provided !== undefined && provided !== null && this.debug) {
+      console.warn('[Datalyr] Ignoring invalid eventId (must be a non-empty string); using a random UUID — redeliveries of this event will NOT be deduplicated.');
+    }
+    return generateEventId();
+  }
+
+  // 9.D.5: caller-supplied event time, normalized to ISO-8601. Accepts ISO string, Date,
+  // or numeric epoch. Numbers < 1e12 are treated as epoch SECONDS (webhook payloads like
+  // Stripe's `event.created` are seconds; 1e12 ms is Sep 2001, so real ms timestamps are
+  // always above it). Invalid input → now, with a debug warning — never a throw.
+  private resolveTimestamp(provided: unknown): string {
+    if (provided !== undefined && provided !== null) {
+      let date: Date | undefined;
+      if (provided instanceof Date) {
+        date = provided;
+      } else if (typeof provided === 'number' && Number.isFinite(provided)) {
+        date = new Date(provided < 1e12 ? provided * 1000 : provided);
+      } else if (typeof provided === 'string' && provided.trim().length > 0) {
+        date = new Date(provided);
+      }
+      if (date && Number.isFinite(date.getTime())) {
+        return date.toISOString();
+      }
+      if (this.debug) {
+        console.warn('[Datalyr] Ignoring invalid timestamp (expected ISO string, Date, or epoch number); using current time.');
+      }
+    }
+    return new Date().toISOString();
   }
 
   private enqueue(event: TrackEvent): void {

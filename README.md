@@ -65,6 +65,8 @@ await datalyr.track({
   event: 'Purchase Completed',     // Required
   userId: 'user_123',              // Optional
   anonymousId: 'anon_from_browser', // Optional — override the auto-generated anonymous ID
+  eventId: 'evt_1Nxxxxx',          // Optional — idempotency key (see below)
+  timestamp: 1751373296,           // Optional — when the event happened (ISO string, Date, or epoch)
   properties: {                    // Optional
     amount: 99.99,
     currency: 'USD',
@@ -80,6 +82,31 @@ await datalyr.track('user_123', 'Purchase Completed', {
 // Pass null as userId for anonymous events
 await datalyr.track(null, 'page_loaded', { url: '/pricing' });
 ```
+
+**`eventId` — idempotent delivery (important for webhooks).** The ingest server
+de-duplicates events on their event id within a **6-hour window**. By default each
+`track()` call generates a fresh UUID, so a *redelivered* webhook (Stripe, Shopify, etc.
+deliver at-least-once) would be counted as a **new** event — double-counting revenue.
+Pass the source system's event id as `eventId` and redeliveries dedup server-side:
+
+```javascript
+await datalyr.track({
+  event: 'Purchase Completed',
+  userId: session.client_reference_id,
+  eventId: stripeEvent.id,        // same id on redelivery → counted once
+  timestamp: stripeEvent.created, // when it happened, not when the retry arrived
+  properties: { amount: session.amount_total / 100 },
+});
+```
+
+`eventId` must be a non-empty string; invalid values are ignored (a random UUID is used,
+with a warning in debug mode) — the SDK never throws for it.
+
+**`timestamp`.** Accepts an ISO-8601 string, a `Date`, or a numeric epoch. Numbers below
+`1e12` are interpreted as epoch **seconds** (webhook payloads like Stripe's
+`event.created` are seconds), larger numbers as milliseconds. Omitted or invalid values
+fall back to the current time. Pass it on delayed webhook replays so the event lands on
+the day it actually happened.
 
 ### identify()
 
@@ -196,6 +223,7 @@ Every event sent to the API has this structure:
   event: 'Purchase Completed',
   userId: 'user_123',                              // undefined if not provided
   anonymousId: 'anon_3d5cf66d-203f-4009-...',      // provided id, else a fresh one per call
+  eventId: 'evt_1Nxxxxx',                          // provided id, else a random UUID per call
   properties: {
     amount: 99.99,
     anonymous_id: 'anon_3d5cf66d-203f-4009-...',   // automatically added (mirrors anonymousId)
@@ -212,7 +240,10 @@ Every event sent to the API has this structure:
 Notes:
 - `anonymous_id` is automatically added to `properties` on every event for attribution.
 - The `context` object identifies the SDK and version.
-- `timestamp` is set to the ISO 8601 time when the event was created.
+- `eventId` is the server-side de-duplication key (6h window). Pass your own (e.g. the
+  webhook event id) for idempotent delivery; otherwise a fresh UUID is generated per call.
+- `timestamp` is the caller-supplied event time normalized to ISO 8601, or the time the
+  event was created when not provided.
 
 ## Batching and Retry Behavior
 
@@ -278,6 +309,11 @@ process.on('SIGTERM', async () => {
 
 ### Stripe Webhooks
 
+Stripe delivers webhooks **at-least-once** — the same event can arrive multiple times.
+Pass the Stripe event id as `eventId` so redeliveries dedup server-side instead of
+double-counting revenue, and `event.created` as `timestamp` so replays land on the day
+the event happened:
+
 ```javascript
 import { Datalyr } from '@datalyr/api';
 import Stripe from 'stripe';
@@ -292,20 +328,32 @@ app.post('/webhooks/stripe', async (req, res) => {
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object;
-      await datalyr.track(session.client_reference_id, 'Purchase Completed', {
-        amount: session.amount_total / 100,
-        currency: session.currency,
-        stripe_session_id: session.id,
+      await datalyr.track({
+        userId: session.client_reference_id,
+        event: 'Purchase Completed',
+        eventId: event.id,          // idempotency: redelivery carries the same id → counted once
+        timestamp: event.created,   // epoch seconds — when it happened, not when delivered
+        properties: {
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          stripe_session_id: session.id,
+        },
       });
       break;
     }
 
     case 'customer.subscription.created': {
       const subscription = event.data.object;
-      await datalyr.track(subscription.metadata.userId, 'Subscription Started', {
-        plan: subscription.items.data[0].price.nickname,
-        mrr: subscription.items.data[0].price.unit_amount / 100,
-        interval: subscription.items.data[0].price.recurring.interval,
+      await datalyr.track({
+        userId: subscription.metadata.userId,
+        event: 'Subscription Started',
+        eventId: event.id,
+        timestamp: event.created,
+        properties: {
+          plan: subscription.items.data[0].price.nickname,
+          mrr: subscription.items.data[0].price.unit_amount / 100,
+          interval: subscription.items.data[0].price.recurring.interval,
+        },
       });
       break;
     }
@@ -333,6 +381,8 @@ const options: TrackOptions = {
   event: 'Purchase Completed',
   userId: 'user_123',
   anonymousId: 'anon_from_browser',
+  eventId: 'evt_1Nxxxxx',              // optional idempotency key
+  timestamp: '2026-07-01T12:00:00Z',   // optional: string | Date | number
   properties: {
     amount: 99.99,
     currency: 'USD',

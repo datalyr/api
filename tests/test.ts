@@ -100,6 +100,45 @@ async function main() {
   assert(calls0 === 1, `review M3: retryLimit:0 honored — 1 attempt, no retries (got ${calls0}; would be 4 if coerced to 3)`);
   await dl0.close();
 
+  // ---- 9.D.1: caller-supplied eventId is the wire event id (webhook idempotency) ----
+  const sentE: any[] = [];
+  mockFetch(sentE);
+  const dle = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+  await dle.track({ userId: 'u1', event: 'purchase', eventId: 'evt_stripe_123' });
+  await dle.track({ userId: 'u1', event: 'purchase', eventId: 'evt_stripe_123' }); // redelivery
+  await dle.track({ userId: 'u1', event: 'no_id_given' });
+  await dle.track({ userId: 'u1', event: 'bad_id_number', eventId: 42 as any });
+  await dle.track({ userId: 'u1', event: 'bad_id_empty', eventId: '' as any });
+  await dle.flush();
+  const byEvt = (n: string) => sentE.filter((e) => e.event === n);
+  assert(byEvt('purchase').length === 2 &&
+    byEvt('purchase')[0].eventId === 'evt_stripe_123' && byEvt('purchase')[1].eventId === 'evt_stripe_123',
+    '9.D.1: caller eventId used VERBATIM — a redelivery carries the SAME wire event id (server dedups)');
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  assert(uuidRe.test(byEvt('no_id_given')[0].eventId),
+    '9.D.1: omitted eventId still gets a random UUID (behavior unchanged)');
+  assert(uuidRe.test(byEvt('bad_id_number')[0].eventId) && uuidRe.test(byEvt('bad_id_empty')[0].eventId),
+    '9.D.1: non-string/empty eventId is IGNORED (uuid fallback, no throw)');
+
+  // ---- 9.D.5: caller-supplied timestamp is honored (delayed webhook replays) ----
+  const iso = '2026-07-01T12:34:56.000Z';
+  await dle.track({ userId: 'u1', event: 'ts_iso', timestamp: iso });
+  await dle.track({ userId: 'u1', event: 'ts_date', timestamp: new Date(iso) });
+  await dle.track({ userId: 'u1', event: 'ts_epoch_seconds', timestamp: 1751373296 }); // Stripe event.created style
+  await dle.track({ userId: 'u1', event: 'ts_epoch_ms', timestamp: 1751373296000 });
+  await dle.track({ userId: 'u1', event: 'ts_invalid', timestamp: 'not a date' as any });
+  await dle.flush();
+  const one = (n: string) => sentE.find((e) => e.event === n);
+  assert(one('ts_iso').timestamp === iso, '9.D.5: ISO-string timestamp honored');
+  assert(one('ts_date').timestamp === iso, '9.D.5: Date timestamp honored');
+  assert(one('ts_epoch_seconds').timestamp === new Date(1751373296 * 1000).toISOString(),
+    '9.D.5: epoch-seconds timestamp (e.g. Stripe event.created) interpreted as seconds');
+  assert(one('ts_epoch_ms').timestamp === new Date(1751373296000).toISOString(),
+    '9.D.5: epoch-milliseconds timestamp honored');
+  assert(Math.abs(Date.parse(one('ts_invalid').timestamp) - Date.now()) < 60_000,
+    '9.D.5: invalid timestamp ignored — falls back to now (no throw)');
+  await dle.close();
+
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

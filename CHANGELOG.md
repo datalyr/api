@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`eventId` on `TrackOptions` (webhook idempotency).** The ingest server de-duplicates
+  on the event id (6h window), but `track()` always minted a fresh UUID — so at-least-once
+  webhook redeliveries (Stripe, Shopify, …) were counted as new events, double-counting
+  revenue. Pass the source event id (e.g. Stripe `event.id`) and redeliveries dedup
+  server-side. Invalid/empty values are ignored (UUID fallback + debug warning), never a
+  throw. Omitted → unchanged behavior (fresh UUID).
+- **`timestamp` on `TrackOptions`.** `track()` hardcoded "now", so delayed webhook
+  replays landed on the wrong day. Accepts ISO string, `Date`, or numeric epoch (values
+  < 1e12 are treated as epoch seconds — e.g. Stripe `event.created`); normalized to
+  ISO-8601. Invalid → now (debug warning). Omitted → unchanged behavior.
+
 ## [1.3.0] - 2026-06-03
 
 ### Fixed

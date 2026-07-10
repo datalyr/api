@@ -1,4 +1,11 @@
 // Stripe webhook integration example for @datalyr/api SDK
+//
+// IDEMPOTENT REDELIVERY: Stripe delivers webhooks at-least-once — the same event can
+// arrive multiple times (retries, replays from the dashboard). Always pass the Stripe
+// event id as `eventId`: Datalyr's ingest de-duplicates on it (6h window), so a
+// redelivered Purchase is counted ONCE instead of double-counting revenue.
+// Also pass `timestamp: event.created` (epoch seconds) so delayed replays land on the
+// day the event actually happened, not the day the retry arrived.
 const express = require('express');
 const { Datalyr } = require('@datalyr/api');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -7,8 +14,8 @@ const app = express();
 const datalyr = new Datalyr(process.env.DATALYR_API_KEY);
 
 // Stripe webhook endpoint
-app.post('/webhooks/stripe', 
-  express.raw({ type: 'application/json' }), 
+app.post('/webhooks/stripe',
+  express.raw({ type: 'application/json' }),
   async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -26,36 +33,40 @@ app.post('/webhooks/stripe',
     switch (event.type) {
       case 'checkout.session.completed':
         const session = event.data.object;
-        
-        // Track purchase
-        await datalyr.track(
-          session.client_reference_id || session.customer,
-          'Purchase Completed',
-          {
+
+        // Track purchase — eventId makes redeliveries idempotent (no double-counted revenue)
+        await datalyr.track({
+          userId: session.client_reference_id || session.customer,
+          event: 'Purchase Completed',
+          eventId: event.id,          // Stripe event id = dedup key on redelivery
+          timestamp: event.created,   // epoch seconds — when it happened, not when delivered
+          properties: {
             amount: session.amount_total / 100,
             currency: session.currency,
             paymentStatus: session.payment_status,
             stripeSessionId: session.id,
             customerEmail: session.customer_details?.email
           }
-        );
+        });
         break;
 
       case 'customer.subscription.created':
         const subscription = event.data.object;
-        
+
         // Track subscription start
-        await datalyr.track(
-          subscription.metadata?.userId || subscription.customer,
-          'Subscription Started',
-          {
+        await datalyr.track({
+          userId: subscription.metadata?.userId || subscription.customer,
+          event: 'Subscription Started',
+          eventId: event.id,
+          timestamp: event.created,
+          properties: {
             plan: subscription.items.data[0].price.nickname,
             amount: subscription.items.data[0].price.unit_amount / 100,
             interval: subscription.items.data[0].price.recurring.interval,
             stripeSubscriptionId: subscription.id,
             status: subscription.status
           }
-        );
+        });
 
         // Update user traits
         await datalyr.identify(
@@ -70,17 +81,19 @@ app.post('/webhooks/stripe',
 
       case 'customer.subscription.deleted':
         const canceledSub = event.data.object;
-        
+
         // Track cancellation
-        await datalyr.track(
-          canceledSub.metadata?.userId || canceledSub.customer,
-          'Subscription Canceled',
-          {
+        await datalyr.track({
+          userId: canceledSub.metadata?.userId || canceledSub.customer,
+          event: 'Subscription Canceled',
+          eventId: event.id,
+          timestamp: event.created,
+          properties: {
             plan: canceledSub.items.data[0].price.nickname,
             cancelReason: canceledSub.cancellation_details?.reason,
             stripeSubscriptionId: canceledSub.id
           }
-        );
+        });
 
         // Update user traits
         await datalyr.identify(
@@ -94,18 +107,20 @@ app.post('/webhooks/stripe',
 
       case 'invoice.payment_failed':
         const invoice = event.data.object;
-        
+
         // Track failed payment
-        await datalyr.track(
-          invoice.metadata?.userId || invoice.customer,
-          'Payment Failed',
-          {
+        await datalyr.track({
+          userId: invoice.metadata?.userId || invoice.customer,
+          event: 'Payment Failed',
+          eventId: event.id,
+          timestamp: event.created,
+          properties: {
             amount: invoice.amount_due / 100,
             currency: invoice.currency,
             attemptCount: invoice.attempt_count,
             stripeInvoiceId: invoice.id
           }
-        );
+        });
         break;
 
       default:

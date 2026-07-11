@@ -281,7 +281,8 @@ export class Datalyr {
       context: {
         library: '@datalyr/api',
         version: SDK_VERSION,
-        source: 'api'
+        source: 'api',
+        schema_version: 1 // A3-25: versioned-envelope stamp
       },
       // 9.D.5: honor a caller-supplied timestamp (ingest reads `event.timestamp || now`),
       // so delayed webhook replays land on the day the event happened, not the replay day.

@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **A3-25: `schema_version` envelope stamp.** Every event's context now carries
+  `schema_version: 1`, the first canonical envelope version shared across the SDK fleet,
+  so the ingest contract layer can key on one version marker.
 - **`eventId` on `TrackOptions` (webhook idempotency).** The ingest server de-duplicates
   on the event id (6h window), but `track()` always minted a fresh UUID — so at-least-once
   webhook redeliveries (Stripe, Shopify, …) were counted as new events, double-counting

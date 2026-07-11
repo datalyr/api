@@ -15,6 +15,40 @@ All notable changes to this project will be documented in this file.
   replays landed on the wrong day. Accepts ISO string, `Date`, or numeric epoch (values
   < 1e12 are treated as epoch seconds — e.g. Stripe `event.created`); normalized to
   ISO-8601. Invalid → now (debug warning). Omitted → unchanged behavior.
+- **`trackPurchase(userId, { value, currency, ... }, opts?)` helper.** Validates `value` is
+  a finite number (a `NaN`/non-number would land as $0 or corrupt revenue rollups —
+  warned-and-dropped, not sent), stamps the canonical `value` field, and uppercases
+  `currency`. Documents the server revenue contract (`value ?? revenue ?? amount`).
+- **`onError(event, error)` and `onDrop(events, reason)` config hooks.** Observe every send
+  failure and every permanent drop (overflow / permanent-4xx / max-attempts / close-timeout /
+  post-close / validation) — e.g. to persist survivors to your own dead-letter store. Hook
+  exceptions are swallowed and can never crash the SDK.
+
+### Fixed
+- **`close()` hung the process up to `closeTimeout` (~30s) after resolving (TR-09).** The
+  drain loop's `Promise.race` budget/pause timers were never cleared, so a won race left a
+  live timer pinning the event loop — reintroducing the exact exit-hang the 1.3.0 unref work
+  fixed. Timers are now canceled when their race settles (proven: process exits ~4ms after
+  `close()` instead of ~8s).
+- **`await flush()` did not guarantee a drain (TR-25).** If a flush was already in flight it
+  returned that promise, which had snapshotted the queue **before** later events — so the
+  serverless `track(); track(); await flush()` pattern stranded the second event. `flush()`
+  now loops until the queue empties (or a pass delivers nothing against a down endpoint).
+- **Invalid args threw out of a fire-and-forget promise (9.D.4).** `track({event:''})`,
+  `identify()`/`alias()`/`group()` with a missing required id used to `throw`, which — for an
+  un-awaited call — surfaced as an `ERR_UNHANDLED_REJECTION` and crashed the host (exit 1).
+  They now warn-and-drop (`onDrop('validation_error')`) and resolve.
+- **A wrong API key black-holed everything silently (9.D.8).** A permanent 4xx (≠ 408/429)
+  was re-queued and retried ~10 flush cycles per event before a generic drop. It is now
+  dropped immediately (no retry/requeue), and `401`/`403` logs a one-time authentication
+  failure. `408`/`429` are now correctly treated as **transient** (retried), not permanent.
+- **`track()` after `close()` was silently dropped (9.D.3).** It now logs one loud error and
+  fires `onDrop('closed')`; `close()` is idempotent under repeat/concurrent calls.
+- **Over-long `eventId` (B-4).** A pathological caller id became a pathological server Redis
+  key; ids over 256 chars are now collapsed to a deterministic hash (redeliveries of the same
+  id still dedup).
+- **`page(userId, name)` left `page_url` blank server-side** — the pageview now falls back to
+  the page name for `properties.url` when no url is given.
 
 ## [1.3.0] - 2026-06-03
 

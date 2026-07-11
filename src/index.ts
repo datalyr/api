@@ -1,4 +1,13 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+
+/** Why an event was dropped, passed to the onDrop hook (9.D.7). */
+export type DropReason =
+  | 'validation_error'   // track/identify/alias/group called with invalid args (9.D.4)
+  | 'queue_overflow'     // maxQueueSize reached; oldest evicted (NODE-5)
+  | 'permanent_client_error' // non-retryable 4xx (≠408/429), e.g. 401/403/400 (9.D.8)
+  | 'max_flush_attempts' // transient failures exceeded MAX_FLUSH_ATTEMPTS cycles (NODE-8)
+  | 'close_timeout'      // still queued when close()'s closeTimeout budget expired (NODE-1)
+  | 'closed';            // track() called after close() (9.D.3)
 
 export interface DatalyrConfig {
   apiKey: string;
@@ -13,6 +22,13 @@ export interface DatalyrConfig {
    *  Must be >= worst-case retry time (sendEvent backoff is up to ~7s for 3 retries),
    *  or close() drops events still mid-retry. */
   closeTimeout?: number;
+  /** 9.D.7: called for every send failure (before any retry/requeue/drop decision), so you
+   *  can log/alert on delivery problems. Never throws into the SDK — exceptions are swallowed. */
+  onError?: (event: TrackEvent, error: Error) => void;
+  /** 9.D.7: called whenever event(s) are permanently dropped, with the reason. Covers ALL
+   *  drop paths (overflow, permanent 4xx, max-attempts, post-close, validation). Never
+   *  throws into the SDK — exceptions are swallowed. Use this to persist to your own DLQ. */
+  onDrop?: (events: TrackEvent[], reason: DropReason) => void;
 }
 
 export interface TrackEvent {
@@ -42,6 +58,14 @@ export interface TrackOptions {
   timestamp?: string | Date | number;
 }
 
+/** 9.D.6: the revenue payload for trackPurchase(). `value` is required and must be a finite
+ *  number (the server reads value ?? revenue ?? amount — value is the canonical field). */
+export interface PurchaseProperties {
+  value: number;
+  currency?: string;
+  [key: string]: any;
+}
+
 // NODE-13: use node:crypto randomUUID unconditionally (GA since Node 14.17). The old
 // global-`crypto` guard fell back to a weak Math.random id on Node <19, and eventId is
 // the SERVER dedup key — a collision there is silent data loss.
@@ -66,6 +90,10 @@ const SDK_VERSION = '1.3.0';
 // forever.
 const MAX_FLUSH_ATTEMPTS = 10;
 
+// B-4: cap the caller-supplied eventId. Longer ids become pathological Redis keys server-side;
+// overflow is hash-collapsed (deterministic, so redeliveries still dedup) below.
+const MAX_EVENT_ID_LENGTH = 256;
+
 export class Datalyr {
   private apiKey: string;
   private host: string;
@@ -80,11 +108,16 @@ export class Datalyr {
   private timer?: NodeJS.Timeout;
   private isFlushing: boolean = false;
   private isClosing: boolean = false;
-  private currentFlush?: Promise<void>;  // the in-flight flush — callers/close() await this instead of getting a no-op (NODE-3)
+  private currentFlush?: Promise<void>;  // the in-flight drain — callers/close() await this instead of getting a no-op (NODE-3/TR-25)
+  private closePromise?: Promise<void>;  // memoized so close() is idempotent under repeat/concurrent calls (9.D.3)
   private warnedNoId = false;            // one-time warn for calls with neither userId nor anonymousId (NODE-6)
-  private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event (NODE-8); WeakMap → no payload pollution
   private warnedQueueFull = false;       // one-time prod warn when the queue overflows (NODE-5)
+  private warnedClosed = false;          // one-time loud error for track() after close() (9.D.3)
+  private warnedAuthFailure = false;     // one-time loud error for 401/403 (9.D.8)
+  private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event (NODE-8); WeakMap → no payload pollution
   private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
+  private onError?: (event: TrackEvent, error: Error) => void; // 9.D.7
+  private onDrop?: (events: TrackEvent[], reason: DropReason) => void; // 9.D.7
 
   constructor(config: DatalyrConfig | string) {
     if (typeof config === 'string') {
@@ -107,6 +140,8 @@ export class Datalyr {
       this.retryLimit = config.retryLimit ?? 3;
       this.maxQueueSize = config.maxQueueSize || 1000;
       this.closeTimeout = config.closeTimeout ?? 30000;
+      this.onError = typeof config.onError === 'function' ? config.onError : undefined;
+      this.onDrop = typeof config.onDrop === 'function' ? config.onDrop : undefined;
     }
 
     if (!this.apiKey) {
@@ -156,17 +191,22 @@ export class Datalyr {
     process.once('beforeExit', this.exitHook);
   }
 
+  // 9.D.7: fan a drop/error out to the caller's observability hook. A hook that throws must
+  // never crash the SDK (the whole point is defensive delivery), so swallow its exceptions.
+  private notifyDrop(events: TrackEvent[], reason: DropReason): void {
+    if (!this.onDrop) return;
+    try { this.onDrop(events, reason); } catch { /* a hook must never break the SDK */ }
+  }
+
+  private notifyError(event: TrackEvent, error: Error): void {
+    if (!this.onError) return;
+    try { this.onError(event, error); } catch { /* a hook must never break the SDK */ }
+  }
+
   // Overloaded track method that accepts TrackOptions
   async track(options: TrackOptions): Promise<void>;
   async track(userId: string | null, event: string, properties?: any): Promise<void>;
   async track(userIdOrOptions: string | null | TrackOptions, event?: string, properties?: any): Promise<void> {
-    if (this.isClosing) {
-      if (this.debug) {
-        console.warn('[Datalyr] SDK is closing, event dropped');
-      }
-      return;
-    }
-
     // Handle both signatures
     let userId: string | undefined;
     let eventName: string;
@@ -190,8 +230,26 @@ export class Datalyr {
       eventProperties = properties || {};
     }
 
+    // 9.D.4: NEVER throw. An invalid event name from deep in caller business logic used to
+    // throw out of this fire-and-forget promise → an ERR_UNHANDLED_REJECTION that crashed
+    // the host process (exit 1). Warn, hand it to onDrop, and resolve.
     if (!eventName || typeof eventName !== 'string') {
-      throw new Error('Event name is required and must be a string');
+      console.warn('[Datalyr] track() requires a non-empty string event name; event dropped.');
+      this.notifyDrop([{ event: String(eventName ?? ''), userId } as TrackEvent], 'validation_error');
+      return;
+    }
+
+    // 9.D.3: close() is terminal. Post-close track() used to drop silently (debug-only). Emit
+    // ONE loud, un-gated error so a mis-ordered shutdown (close() before the last track) is
+    // visible in prod; every dropped event still reaches onDrop for programmatic handling.
+    // For serverless, prefer `await flush()` per invocation and reserve close() for shutdown.
+    if (this.isClosing) {
+      if (!this.warnedClosed) {
+        this.warnedClosed = true;
+        console.error('[Datalyr] track() called after close() — event dropped. close() is terminal; use flush() per invocation (e.g. serverless) and close() only at shutdown.');
+      }
+      this.notifyDrop([{ event: eventName, userId } as TrackEvent], 'closed');
+      return;
     }
 
     // NODE-6: use the caller-provided anonymousId, else a FRESH one per call — NEVER a
@@ -234,8 +292,11 @@ export class Datalyr {
   }
 
   async identify(userId: string, traits?: any, anonymousId?: string): Promise<void> {
+    // 9.D.4: warn-and-drop, never throw (see track()).
     if (!userId) {
-      throw new Error('userId is required for identify');
+      console.warn('[Datalyr] identify() requires a userId; call dropped.');
+      this.notifyDrop([{ event: '$identify' } as TrackEvent], 'validation_error');
+      return;
     }
     // Route through the options form so a caller-provided anonymousId is honored (NODE-6).
     // track() stamps anonymous_id itself — no need to inject the (formerly shared) one.
@@ -244,8 +305,11 @@ export class Datalyr {
   }
 
   async alias(newUserId: string, previousId?: string, anonymousId?: string): Promise<void> {
+    // 9.D.4: warn-and-drop, never throw.
     if (!newUserId) {
-      throw new Error('newUserId is required for alias');
+      console.warn('[Datalyr] alias() requires a newUserId; call dropped.');
+      this.notifyDrop([{ event: '$alias' } as TrackEvent], 'validation_error');
+      return;
     }
     // Resolve the anon up front so the event's anonymousId and previous_id line up
     // (and so previous_id isn't a different freshly-generated id than the event carries).
@@ -263,21 +327,72 @@ export class Datalyr {
   }
 
   async page(userId: string, name?: string, properties?: any, anonymousId?: string): Promise<void> {
-    return this.track({ userId: userId || undefined, anonymousId, event: '$pageview', properties: { name, ...properties } });
+    const props: Record<string, any> = { name, ...properties };
+    // P3: ingest derives page_url ONLY from props.url, so a name-only page() call left
+    // page_url blank server-side. When the caller gives no url, fall back to the page name
+    // so the pageview is at least addressable (callers who want a real URL should pass one).
+    if (props.url == null && name != null) props.url = name;
+    return this.track({ userId: userId || undefined, anonymousId, event: '$pageview', properties: props });
   }
 
+  /**
+   * NOTE: `$group` currently has NO server-side semantics — the ingest pipeline does not
+   * build account/group associations from it, so this records a plain event with the group
+   * traits in properties and nothing more. Kept for API compatibility; don't rely on it for
+   * B2B account rollups yet.
+   */
   async group(userId: string, groupId: string, traits?: any, anonymousId?: string): Promise<void> {
+    // 9.D.4: warn-and-drop, never throw.
     if (!groupId) {
-      throw new Error('groupId is required for group');
+      console.warn('[Datalyr] group() requires a groupId; call dropped.');
+      this.notifyDrop([{ event: '$group', userId } as TrackEvent], 'validation_error');
+      return;
     }
     return this.track({ userId, anonymousId, event: '$group', properties: { groupId, ...traits } });
   }
 
-  // 9.D.1: caller-supplied idempotency key. Defensive by design — this SDK must never
-  // crash the host — so anything that isn't a non-empty string is IGNORED (fresh uuid,
-  // same as omitting it) with a debug warning, never a throw.
+  /**
+   * 9.D.6: purchase helper with a validated revenue amount. The ingest revenue pipeline
+   * reads `value ?? revenue ?? amount` (in that order) — `value` is the canonical field —
+   * so this stamps `value` and (defensively) requires it to be a FINITE number. A NaN /
+   * Infinity / non-number value would land as $0 or corrupt revenue rollups, so it is
+   * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency) and
+   * timestamp (backdating) exactly like track().
+   */
+  async trackPurchase(
+    userId: string | null,
+    purchase: PurchaseProperties,
+    opts?: { anonymousId?: string; eventId?: string; timestamp?: string | Date | number }
+  ): Promise<void> {
+    const value = purchase?.value;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      console.warn('[Datalyr] trackPurchase() requires a finite numeric `value` (revenue amount); event dropped.');
+      this.notifyDrop([{ event: 'purchase', userId: userId || undefined } as TrackEvent], 'validation_error');
+      return;
+    }
+    return this.track({
+      userId: userId || undefined,
+      anonymousId: opts?.anonymousId,
+      event: 'purchase',
+      eventId: opts?.eventId,
+      timestamp: opts?.timestamp,
+      properties: { ...purchase, value, currency: (purchase.currency || 'USD').toUpperCase() }
+    });
+  }
+
+  // 9.D.1 + B-4: caller-supplied idempotency key. Defensive by design — this SDK must never
+  // crash the host — so anything that isn't a non-empty string is IGNORED (fresh uuid, same
+  // as omitting it) with a debug warning, never a throw. An over-long id (pathological Redis
+  // key server-side) is collapsed to a DETERMINISTIC sha256-based value so redeliveries of
+  // the same id still map to the same key and dedup.
   private resolveEventId(provided: unknown): string {
     if (typeof provided === 'string' && provided.trim().length > 0) {
+      if (provided.length > MAX_EVENT_ID_LENGTH) {
+        // Keep a readable prefix for debugging, append a full sha256 (64 hex) so the result
+        // is deterministic and unique per input, total 191 + 1 + 64 = 256 chars.
+        const digest = createHash('sha256').update(provided).digest('hex');
+        return provided.slice(0, MAX_EVENT_ID_LENGTH - 65) + '-' + digest;
+      }
       return provided; // verbatim — must match exactly across redeliveries to dedup
     }
     if (provided !== undefined && provided !== null && this.debug) {
@@ -318,7 +433,9 @@ export class Datalyr {
         this.warnedQueueFull = true;
         console.warn(`[Datalyr] Queue full (${this.maxQueueSize}) — dropping oldest events. Increase maxQueueSize, or flush()/close() more often.`);
       }
-      this.queue.shift(); // Remove oldest event
+      const dropped = this.queue.shift(); // Remove oldest event
+      // 9.D.7: overflow is a drop path — surface it so callers can persist to their own DLQ.
+      if (dropped) this.notifyDrop([dropped], 'queue_overflow');
     }
 
     this.queue.push(event);
@@ -339,15 +456,16 @@ export class Datalyr {
 
   async flush(): Promise<void> {
     if (this.queue.length === 0) return;
-    // NODE-3: if a flush is already running, AWAIT it (return the in-flight promise)
-    // rather than no-op'ing — otherwise callers (and close()) get a silently-resolved
-    // promise while their events sit unsent.
+    // NODE-3 / TR-25: if a drain is already running, AWAIT it (return the in-flight promise)
+    // rather than no-op'ing. Because the drain LOOPS until the queue empties, awaiting it now
+    // also guarantees events enqueued AFTER it started are sent — fixing the serverless
+    // `track(); track(); await flush(); return` bug where the second event stranded.
     if (this.isFlushing) {
       return this.currentFlush ?? Promise.resolve();
     }
 
     this.isFlushing = true;
-    this.currentFlush = this._flush();
+    this.currentFlush = this._drain();
     try {
       await this.currentFlush;
     } finally {
@@ -356,7 +474,24 @@ export class Datalyr {
     }
   }
 
-  private async _flush(): Promise<void> {
+  // TR-25: a single _flush pass snapshots the queue, so events enqueued during the pass — or
+  // failures it re-queues — would strand on `await flush()`. Loop passes until the queue is
+  // empty or a pass DELIVERS NOTHING (every event failed: a down endpoint re-queued/dropped
+  // them all). Progress must be measured by successful sends, NOT queue length — a pass that
+  // sends e1 while e2 arrives leaves the length unchanged yet clearly made progress. The
+  // zero-progress break stops us hot-spinning against a down endpoint (the flush timer /
+  // close() budget retries later); the hard cap is a belt-and-suspenders termination
+  // guarantee if a producer keeps enqueuing during the drain.
+  private async _drain(): Promise<void> {
+    for (let pass = 0; this.queue.length > 0 && pass < MAX_FLUSH_ATTEMPTS + 2; pass++) {
+      const sent = await this._flush();
+      if (sent === 0) break;
+    }
+  }
+
+  // Returns the number of events SUCCESSFULLY sent this pass (events.length − failed), so
+  // _drain can tell real progress from a fully-failing endpoint (see _drain).
+  private async _flush(): Promise<number> {
     // Take all events from queue
     const events = [...this.queue];
     this.queue = [];
@@ -374,16 +509,34 @@ export class Datalyr {
     for (let i = 0; i < events.length; i += batchSize) {
       const batch = events.slice(i, i + batchSize);
       const promises = batch.map(event =>
-        this.sendEvent(event).catch(() => {
+        this.sendEvent(event).catch((err: any) => {
           failed++;
+          // 9.D.7: every send failure reaches onError before any drop/requeue decision.
+          this.notifyError(event, err instanceof Error ? err : new Error(String(err)));
+
+          // 9.D.8: a permanent client error (4xx ≠ 408/429 — bad key, malformed, forbidden)
+          // will NEVER succeed on retry, so drop it IMMEDIATELY instead of cycling it 10
+          // times. A wrong API key (401/403) black-holes everything, so raise it loudly ONCE
+          // as an auth failure — the single most common "no data" support case.
+          if (err && err.permanent) {
+            if ((err.status === 401 || err.status === 403) && !this.warnedAuthFailure) {
+              this.warnedAuthFailure = true;
+              console.error(`[Datalyr] Authentication failing (HTTP ${err.status}) — check your API key ("dk_..."). Events are being dropped.`);
+            }
+            this.notifyDrop([event], 'permanent_client_error');
+            return;
+          }
+
           // NODE-8 / NODE-9 / NODE-10: bound re-queue attempts so a permanently-failing
-          // event can't cycle at the front forever (re-failing every flush). Count failed
-          // flush-cycles per event (WeakMap, no payload pollution); drop with a VISIBLE
-          // warn after retryLimit cycles. Re-queue at the front so failures retry first.
+          // (transient) event can't cycle at the front forever (re-failing every flush).
+          // Count failed flush-cycles per event (WeakMap, no payload pollution); drop with a
+          // VISIBLE warn after MAX_FLUSH_ATTEMPTS cycles. Re-queue at the front so failures
+          // retry first.
           const n = (this.flushAttempts.get(event) || 0) + 1;
           this.flushAttempts.set(event, n);
           if (n >= MAX_FLUSH_ATTEMPTS) {
             console.warn(`[Datalyr] Dropping event after ${n} failed flush attempts: ${event.event}`);
+            this.notifyDrop([event], 'max_flush_attempts');
           } else {
             this.queue.unshift(event);
           }
@@ -395,6 +548,8 @@ export class Datalyr {
     if (failed > 0 && this.debug) {
       console.error(`[Datalyr] ${failed} events failed to send this flush`);
     }
+
+    return events.length - failed;
   }
 
   private async sendEvent(event: TrackEvent, retryCount = 0): Promise<void> {
@@ -424,13 +579,21 @@ export class Datalyr {
           // Ignore body read errors
         }
 
-        // Don't retry on 4xx errors (client errors)
-        if (response.status >= 400 && response.status < 500) {
-          throw new Error(`Client error: ${response.status} ${response.statusText} - ${errorText}`);
+        // 9.D.8: 408 (Request Timeout) and 429 (Too Many Requests) are TRANSIENT — retry
+        // them like 5xx. Every other 4xx is a permanent client error: tag it so the flush
+        // layer drops it immediately instead of cycling it MAX_FLUSH_ATTEMPTS times.
+        if (response.status !== 408 && response.status !== 429 &&
+            response.status >= 400 && response.status < 500) {
+          const err: any = new Error(`Client error: ${response.status} ${response.statusText} - ${errorText}`);
+          err.status = response.status;
+          err.permanent = true;
+          throw err;
         }
 
-        // Retry on 5xx errors (server errors)
-        throw new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
+        // Retry on 5xx / 408 / 429 (transient)
+        const err: any = new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
+        err.status = response.status;
+        throw err;
       }
 
       if (this.debug) {
@@ -443,15 +606,15 @@ export class Datalyr {
         }
       }
     } catch (error: any) {
-      // Don't retry client errors
-      if (error.message?.startsWith('Client error:')) {
+      // Don't retry permanent client errors (bad key/forbidden/malformed).
+      if (error && error.permanent) {
         if (this.debug) {
           console.error('[Datalyr] Permanent error, not retrying:', error.message);
         }
         throw error;
       }
 
-      // Retry server errors with exponential backoff
+      // Retry server errors / network failures with exponential backoff
       if (retryCount < this.retryLimit) {
         if (this.debug) {
           console.log(`[Datalyr] Retrying event (attempt ${retryCount + 1}/${this.retryLimit})`);
@@ -495,8 +658,26 @@ export class Datalyr {
     return generateAnonymousId();
   }
 
+  // A cancelable delay: TR-09. Returns the promise AND a cancel() that clears the underlying
+  // timer, so a Promise.race that settles via the OTHER arm doesn't leave a live (non-unref'd)
+  // timer holding the event loop open until it fires — the exact hang the 1.3.0 unref work
+  // fixed and the close() race timer had reintroduced.
+  private delay(ms: number): { promise: Promise<void>; cancel: () => void } {
+    let timer: NodeJS.Timeout | undefined;
+    const promise = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); });
+    return { promise, cancel: () => { if (timer) clearTimeout(timer); } };
+  }
+
   // Cleanup
   async close(): Promise<void> {
+    // 9.D.3: idempotent — repeat or concurrent close() calls share ONE drain and never
+    // restart it (a second close() must not re-run the loop or double-remove the exit hook).
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this._close();
+    return this.closePromise;
+  }
+
+  private async _close(): Promise<void> {
     this.isClosing = true;
 
     if (this.timer) {
@@ -507,8 +688,8 @@ export class Datalyr {
     // NODE-1/2/4: actually DRAIN the queue. The old close() flushed ONCE and raced a hard
     // 5s timeout — one flush isn't enough (it re-queues failures), a no-op flush won if one
     // was in flight, and 5s < worst-case retry (~7s) dropped mid-retry events. Loop flush()
-    // (which now awaits an in-flight flush instead of no-op'ing) until the queue drains or
-    // the configurable closeTimeout budget expires.
+    // (which now drains until the queue empties instead of no-op'ing) until the queue drains
+    // or the configurable closeTimeout budget expires.
     //
     // review H1/H2: each flush() runs the FULL per-event retry chain (retryLimit × timeout
     // + backoff) before returning, which would overshoot closeTimeout by multiples and hang
@@ -516,18 +697,32 @@ export class Datalyr {
     // real wall-clock bound. An in-flight flush whose budget expires keeps running in the
     // background (best-effort delivery; it has its own .catch), so close() never blocks past
     // its budget.
+    //
+    // TR-09: the budget + pause timers are CANCELED when their race settles (this.delay), so
+    // a won race never leaves a live timer pinning the event loop for up to closeTimeout ms
+    // after close() resolved (proven: close resolved 14ms, process exited 8016ms).
     const start = Date.now();
     const deadline = start + this.closeTimeout;
     while (this.queue.length > 0 && Date.now() < deadline) {
       const remaining = deadline - Date.now();
-      await Promise.race([
-        this.flush().catch(() => {}),
-        new Promise<void>((resolve) => setTimeout(resolve, remaining)),
-      ]);
+      const budget = this.delay(remaining);
+      try {
+        await Promise.race([
+          this.flush().catch(() => {}),
+          budget.promise,
+        ]);
+      } finally {
+        budget.cancel();
+      }
       // If events remain (failed + re-queued) and no flush is in flight, pause briefly so
       // we don't hot-loop against a still-failing endpoint (bounded by the deadline).
       if (this.queue.length > 0 && !this.isFlushing && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+        const pause = this.delay(Math.min(100, Math.max(0, deadline - Date.now())));
+        try {
+          await pause.promise;
+        } finally {
+          pause.cancel();
+        }
       }
     }
 
@@ -538,7 +733,11 @@ export class Datalyr {
     }
 
     if (this.queue.length > 0) {
-      console.warn(`[Datalyr] close(): ${this.queue.length} event(s) undelivered after ~${Date.now() - start}ms (budget ${this.closeTimeout}ms).`);
+      const undelivered = [...this.queue];
+      console.warn(`[Datalyr] close(): ${undelivered.length} event(s) undelivered after ~${Date.now() - start}ms (budget ${this.closeTimeout}ms).`);
+      // 9.D.7: hand the survivors to onDrop so callers can persist them (their durability is
+      // now the caller's — close() has given up on them).
+      this.notifyDrop(undelivered, 'close_timeout');
     }
   }
 }

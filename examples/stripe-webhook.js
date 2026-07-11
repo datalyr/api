@@ -11,7 +11,12 @@ const { Datalyr } = require('@datalyr/api');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-const datalyr = new Datalyr(process.env.DATALYR_API_KEY);
+const datalyr = new Datalyr({
+  apiKey: process.env.DATALYR_API_KEY,
+  // Observability: never lose a revenue event silently. onDrop fires whenever an event is
+  // permanently dropped (bad key, overflow, close-timeout, …) — persist it to your own DLQ.
+  onDrop: (events, reason) => console.error(`[datalyr] dropped ${events.length} event(s): ${reason}`),
+});
 
 // Stripe webhook endpoint
 app.post('/webhooks/stripe',
@@ -34,20 +39,21 @@ app.post('/webhooks/stripe',
       case 'checkout.session.completed':
         const session = event.data.object;
 
-        // Track purchase — eventId makes redeliveries idempotent (no double-counted revenue)
-        await datalyr.track({
-          userId: session.client_reference_id || session.customer,
-          event: 'Purchase Completed',
-          eventId: event.id,          // Stripe event id = dedup key on redelivery
-          timestamp: event.created,   // epoch seconds — when it happened, not when delivered
-          properties: {
-            amount: session.amount_total / 100,
+        // trackPurchase() stamps the canonical `value` field (the server reads the amount as
+        // value ?? revenue ?? amount) and validates it's a finite number, so a bad amount is
+        // dropped rather than counted as $0. eventId makes redeliveries idempotent (no
+        // double-counted revenue); timestamp backdates delayed replays.
+        await datalyr.trackPurchase(
+          session.client_reference_id || session.customer,
+          {
+            value: session.amount_total / 100,
             currency: session.currency,
             paymentStatus: session.payment_status,
             stripeSessionId: session.id,
             customerEmail: session.customer_details?.email
-          }
-        });
+          },
+          { eventId: event.id, timestamp: event.created }
+        );
         break;
 
       case 'customer.subscription.created':

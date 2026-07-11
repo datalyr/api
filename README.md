@@ -45,8 +45,11 @@ const datalyr = new Datalyr({
   flushInterval: 10000,       // Flush timer interval in ms (default: 10000)
   debug: false,               // Log events and errors to console (default: false)
   timeout: 10000,             // HTTP request timeout in ms (default: 10000, range: 1000-60000)
-  retryLimit: 3,              // Max retries for failed requests (default: 3)
+  retryLimit: 3,              // Max retries for failed requests (default: 3, range: 0-10)
   maxQueueSize: 1000,         // Max queued events before dropping oldest (default: 1000, range: 100-10000)
+  closeTimeout: 30000,        // Max ms close() spends draining before giving up (default: 30000, range: 1000-120000)
+  onError: (event, error) => {},          // Optional — called on every send failure (before retry/drop)
+  onDrop: (events, reason) => {},         // Optional — called whenever event(s) are permanently dropped
 });
 
 // String shorthand — uses all defaults
@@ -163,6 +166,11 @@ await datalyr.group(userId: string, groupId: string, traits?: any);
 
 Associate a user with a group (company, team, etc.). Internally sends a `$group` event.
 
+> ⚠️ **No server-side semantics yet.** `$group` is currently recorded as a plain event with
+> the group traits in `properties`; the ingest pipeline does **not** build account/group
+> associations from it. Don't rely on `group()` for B2B account rollups today — it's kept for
+> API compatibility.
+
 ```javascript
 await datalyr.group('user_123', 'company_456', {
   name: 'Acme Corp',
@@ -171,17 +179,49 @@ await datalyr.group('user_123', 'company_456', {
 });
 ```
 
-### flush()
+### trackPurchase()
 
-Send all queued events immediately.
+Convenience helper for revenue events. Validates that `value` is a **finite number** (a
+`NaN`/`Infinity`/non-number would land as $0 or corrupt revenue rollups, so it is
+warned-and-dropped, never sent), stamps the canonical `value` field, and uppercases
+`currency` (default `USD`). `opts` forwards `eventId` (webhook idempotency) and `timestamp`
+exactly like `track()`.
 
 ```javascript
-await datalyr.flush();
+await datalyr.trackPurchase('user_123',
+  { value: 49.99, currency: 'usd', plan: 'pro' },
+  { eventId: stripeEvent.id, timestamp: stripeEvent.created });
+```
+
+> **Revenue field contract.** The ingest revenue pipeline reads the amount as
+> `value ?? revenue ?? amount` (in that order) — **`value` is the canonical field**.
+> `trackPurchase()` always sets `value`; if you use plain `track()` for purchases, put the
+> amount in `value` (or at least `revenue`/`amount`) so it isn't counted as $0.
+
+### flush()
+
+Drains **all** queued events and resolves once they've been sent (or a pass makes no
+progress against a down endpoint). Because it fully drains — including events enqueued while
+a flush was already in flight — this is the call to use in **serverless / per-invocation**
+handlers where the instance may freeze right after you return:
+
+```javascript
+// e.g. AWS Lambda / Cloud Functions — flush per invocation, do NOT close() the client
+export async function handler(event) {
+  await datalyr.track({ userId: event.userId, event: 'api_call' });
+  await datalyr.flush();   // guarantees delivery before the instance freezes
+  return { ok: true };
+}
 ```
 
 ### close()
 
-Stops the flush timer, then attempts a final flush with a **5-second timeout**. Any events still queued after the timeout are dropped. New events tracked after `close()` is called are silently ignored.
+Stops the flush timer, then drains the queue until empty or the configured **`closeTimeout`**
+(default **30s**, race-bounded so it never overshoots) expires. `close()` is **terminal and
+idempotent** — repeat/concurrent calls share one drain. Events tracked **after** `close()`
+are dropped and a single loud error is logged (use `flush()` per invocation for serverless;
+reserve `close()` for process shutdown). Any events still undelivered at the budget are
+handed to `onDrop(events, 'close_timeout')`.
 
 ```javascript
 process.on('SIGTERM', async () => {
@@ -189,6 +229,33 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 ```
+
+### Delivery hooks — `onError` / `onDrop`
+
+Pass these in the config for observability into delivery problems (e.g. persist survivors to
+your own dead-letter store, or alert on a bad API key):
+
+```javascript
+const datalyr = new Datalyr({
+  apiKey: 'dk_...',
+  onError: (event, error) => log.warn('datalyr send failed', { event: event.event, error }),
+  onDrop:  (events, reason) => deadLetter.saveAll(events, reason),
+});
+```
+
+`onError` fires on **every** send failure (before any retry/requeue/drop decision). `onDrop`
+fires whenever event(s) are **permanently** dropped, with a `reason`:
+
+| `reason` | When |
+| --- | --- |
+| `validation_error` | `track`/`identify`/`alias`/`group`/`trackPurchase` called with invalid args |
+| `queue_overflow` | `maxQueueSize` reached — oldest event evicted |
+| `permanent_client_error` | Non-retryable 4xx (≠ 408/429) — e.g. `401`/`403`/`400` |
+| `max_flush_attempts` | Transient failures exceeded the internal retry-cycle cap |
+| `close_timeout` | Still queued when `close()`'s `closeTimeout` budget expired |
+| `closed` | `track()` called after `close()` |
+
+Both hooks are wrapped — an exception thrown inside your hook can never crash the SDK.
 
 ### getAnonymousId()
 
@@ -252,9 +319,9 @@ concurrency window, **not** a single batched request (one POST per event).
 
 - **Auto-flush triggers:** when the queue reaches `flushAt` events, or every `flushInterval` ms.
 - **Concurrency:** up to 10 events are sent in parallel within a single flush.
-- **Queue overflow:** when the queue reaches `maxQueueSize`, the oldest event is dropped to make room (a warning is logged once).
-- **Retry:** 5xx (server) errors are retried up to `retryLimit` times with jittered exponential backoff (≈1s, 2s, 4s, … capped at 10s). 4xx (client) errors are permanent failures and are not retried.
-- **Failed events:** re-queued at the front and retried on later flushes; dropped (with a warning) after repeated failed flush cycles so one permanently-failing event can't block the queue.
+- **Queue overflow:** when the queue reaches `maxQueueSize`, the oldest event is dropped to make room (a warning is logged once, and `onDrop(..., 'queue_overflow')` fires).
+- **Retry:** 5xx (server) errors — plus **408** (Request Timeout) and **429** (Too Many Requests) — are retried up to `retryLimit` times with jittered exponential backoff (≈1s, 2s, 4s, … capped at 10s). Every other 4xx (client) error is a **permanent** failure: the event is dropped immediately (no retry, no requeue) and `onDrop(..., 'permanent_client_error')` fires. A `401`/`403` additionally logs a one-time **authentication-failure** error — the most common "no data" cause is a wrong API key.
+- **Failed events:** transient failures are re-queued at the front and retried on later flushes; dropped (with a warning + `onDrop(..., 'max_flush_attempts')`) after repeated failed flush cycles so one permanently-failing event can't block the queue.
 - **Shutdown:** `await close()` keeps flushing until the queue drains or `closeTimeout` (default 30s) expires.
 
 ## Attribution Preservation

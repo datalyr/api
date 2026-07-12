@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-12
+
 ### Added
 - **A3-25: `schema_version` envelope stamp.** Every event's context now carries
   `schema_version: 1`, the first canonical envelope version shared across the SDK fleet,

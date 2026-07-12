@@ -297,7 +297,7 @@ Every event sent to the API has this structure:
   },
   context: {
     library: '@datalyr/api',
-    version: '1.3.0',
+    version: '1.3.1',
     source: 'api',
   },
   timestamp: '2025-01-15T10:30:00.000Z',

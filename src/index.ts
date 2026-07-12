@@ -81,7 +81,7 @@ function generateAnonymousId(): string {
   return 'anon_' + randomUUID();
 }
 
-const SDK_VERSION = '1.3.0';
+const SDK_VERSION = '1.3.1';
 
 // NODE-8: max FAILED flush-cycles before an event is dropped (DLQ-lite). Separate from —
 // and more generous than — retryLimit (the per-send retry count): a brief outage spans a

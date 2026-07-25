@@ -17,8 +17,11 @@ Version 1.3.1. Full reference: [Node.js SDK](https://docs.datalyr.com/sdk-refere
 | TypeScript types | Included |
 
 > **Run this SDK on Node 18 or later.** It calls global `fetch` and `AbortController`.
-> Node 16 and earlier do not provide either, and the SDK fails at the first send. The
-> `engines.node` field in `package.json` states `>=14.17.0`. That field is wrong.
+> Node 16 and earlier do not provide either, and the SDK fails at the first send.
+> `engines.node` declares `>=18.0.0` as of **1.3.2**, so npm now warns you before you
+> install it on a runtime that cannot run it. Published versions up to and including
+> **1.3.1 declare `>=14.17.0` and install silently on Node 14–16**, where they fail at
+> the first send rather than at install time.
 
 ## Installation
 

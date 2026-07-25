@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-07-25
+
+### Changed
+- **NODE-01: `engines.node` raised to `>=18.0.0`.** The SDK calls global `fetch` and
+  `AbortController`; Node 16 and earlier provide neither and the SDK fails at the first
+  send. `engines` nonetheless declared `>=14.17.0`, so npm installed it silently on
+  runtimes that cannot run it and the failure surfaced at the first event instead of at
+  install time. The field was corrected in the tree on 2026-07-25 but the tree was still
+  version 1.3.1, identical to what was published — so the correction could not reach
+  anyone. This release is what ships it.
+
+### Fixed
+- **README documented the fixed bug as live.** It stated that `engines.node` "states
+  `>=14.17.0`. That field is wrong." It now describes the `>=18.0.0` declaration shipping
+  here, and states plainly that published versions up to 1.3.1 install silently on Node
+  14–16.
+
 ## [1.3.1] - 2026-07-12
 
 ### Added

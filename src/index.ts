@@ -39,6 +39,7 @@ export interface TrackEvent {
   properties?: Record<string, any>;
   context?: Record<string, any>;
   timestamp?: string;
+  externalIds?: Record<string, string>;
 }
 
 export interface TrackOptions {
@@ -56,6 +57,15 @@ export interface TrackOptions {
    *  `event.created`). Defaults to now. Invalid values are ignored (defaults to now) —
    *  pass this on delayed webhook replays so the event lands on the right day. */
   timestamp?: string | Date | number;
+  /** Declared external identity namespaces (Datalyr person contract §6):
+   *  `{ namespace: id }`, e.g. `{ stripe: 'cus_123', crm: 'acct_9' }`. Use this for
+   *  ANY identifier that is not the same userId your client-side identify() uses —
+   *  internal database ids, provider customer ids, private namespaces. Declared ids
+   *  join the customer journey the moment the same namespace value is bound to an
+   *  account identifier from any producer. Do NOT put private ids in `userId` or
+   *  `anonymousId` — they cannot join there and the workspace health surface will
+   *  flag them as an unjoined namespace. */
+  externalIds?: Record<string, string>;
 }
 
 /** 9.D.6: the revenue payload for trackPurchase(). `value` is required and must be a finite
@@ -214,6 +224,7 @@ export class Datalyr {
     let providedAnonymousId: string | undefined;
     let providedEventId: string | undefined;
     let providedTimestamp: string | Date | number | undefined;
+    let providedExternalIds: Record<string, string> | undefined;
 
     if (typeof userIdOrOptions === 'object' && userIdOrOptions !== null) {
       // TrackOptions signature
@@ -223,6 +234,7 @@ export class Datalyr {
       providedAnonymousId = userIdOrOptions.anonymousId;
       providedEventId = userIdOrOptions.eventId;
       providedTimestamp = userIdOrOptions.timestamp;
+      providedExternalIds = userIdOrOptions.externalIds;
     } else {
       // Legacy signature: (userId, event, properties)
       userId = userIdOrOptions || undefined;
@@ -271,6 +283,10 @@ export class Datalyr {
     const trackEvent: TrackEvent = {
       userId: userId || undefined,
       anonymousId: anonymousId,  // Always include for identity resolution
+      // Person contract §6: declared namespaces ride the envelope top-level;
+      // the ingest worker classifies + preserves them for identity joining.
+      ...(providedExternalIds && typeof providedExternalIds === 'object'
+        ? { externalIds: providedExternalIds } : {}),
       // 9.D.1: honor a caller-supplied eventId VERBATIM — it is the ingest server's dedup
       // key (6h window), so webhook handlers can pass the source event id (e.g. Stripe
       // `event.id`) and at-least-once redeliveries no longer double-count revenue. A fresh

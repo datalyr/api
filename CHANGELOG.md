@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-09-03
+
+### Added
+- `externalIds` on `track()` options (person contract §6): `{ namespace: id }` declared identities, e.g. `{ stripe: 'cus_123' }`, sent top-level on the envelope. Ingest classifies them as declared namespaces so they join the customer journey; undeclared namespaces are reported as unjoined rather than minting a person.
+
+### Fixed
+- The `SDK_VERSION` sent in `context.library.version` and the `User-Agent` was stuck at `1.3.1` through the 1.3.2 release; it now matches the package version.
+
 ## [1.3.2] - 2026-07-25
 
 ### Changed

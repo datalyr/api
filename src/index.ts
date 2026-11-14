@@ -91,7 +91,7 @@ function generateAnonymousId(): string {
   return 'anon_' + randomUUID();
 }
 
-const SDK_VERSION = '1.3.3'; // keep in sync with package.json (was stuck at 1.3.1 through the 1.3.2 release)
+const SDK_VERSION = '1.3.4'; // keep in sync with package.json
 
 // NODE-8: max FAILED flush-cycles before an event is dropped (DLQ-lite). Separate from —
 // and more generous than — retryLimit (the per-send retry count): a brief outage spans a
@@ -118,6 +118,7 @@ export class Datalyr {
   private timer?: NodeJS.Timeout;
   private isFlushing: boolean = false;
   private isClosing: boolean = false;
+  private closeFinished = false;         // close() has given up; a late transient failure is dropped, not re-queued (DLR-8)
   private currentFlush?: Promise<void>;  // the in-flight drain — callers/close() await this instead of getting a no-op (NODE-3/TR-25)
   private closePromise?: Promise<void>;  // memoized so close() is idempotent under repeat/concurrent calls (9.D.3)
   private warnedNoId = false;            // one-time warn for calls with neither userId nor anonymousId (NODE-6)
@@ -472,14 +473,18 @@ export class Datalyr {
   }
 
   async flush(): Promise<void> {
-    if (this.queue.length === 0) return;
     // NODE-3 / TR-25: if a drain is already running, AWAIT it (return the in-flight promise)
     // rather than no-op'ing. Because the drain LOOPS until the queue empties, awaiting it now
     // also guarantees events enqueued AFTER it started are sent — fixing the serverless
     // `track(); track(); await flush(); return` bug where the second event stranded.
+    // DLR-8: this check must come BEFORE the empty-queue return. _flush() empties the queue
+    // as soon as a pass starts, so after an auto-flush (flushAt reached) took the events the
+    // queue is empty while their POSTs/retries are still running — returning early there let
+    // `await flush()` resolve with sends in flight (serverless freeze → silent loss).
     if (this.isFlushing) {
       return this.currentFlush ?? Promise.resolve();
     }
+    if (this.queue.length === 0) return;
 
     this.isFlushing = true;
     this.currentFlush = this._drain();
@@ -549,6 +554,15 @@ export class Datalyr {
           // Count failed flush-cycles per event (WeakMap, no payload pollution); drop with a
           // VISIBLE warn after MAX_FLUSH_ATTEMPTS cycles. Re-queue at the front so failures
           // retry first.
+          // DLR-8: a send still running when close()'s budget expired is not in the queue,
+          // so close() could not report it. If it now fails transiently, re-queueing would
+          // strand it on a closed client (no timer, no further drain) — never sent, never
+          // reported. Hand it to onDrop as close_timeout instead.
+          if (this.closeFinished) {
+            this.notifyDrop([event], 'close_timeout');
+            return;
+          }
+
           const n = (this.flushAttempts.get(event) || 0) + 1;
           this.flushAttempts.set(event, n);
           if (n >= MAX_FLUSH_ATTEMPTS) {
@@ -718,9 +732,13 @@ export class Datalyr {
     // TR-09: the budget + pause timers are CANCELED when their race settles (this.delay), so
     // a won race never leaves a live timer pinning the event loop for up to closeTimeout ms
     // after close() resolved (proven: close resolved 14ms, process exited 8016ms).
+    //
+    // DLR-8: also loop while a drain is in flight with an EMPTY queue (an auto-flush already
+    // took the events). flush() returns that drain, so close() waits for its sends — and
+    // their onDrop/onError — instead of resolving at ~0ms.
     const start = Date.now();
     const deadline = start + this.closeTimeout;
-    while (this.queue.length > 0 && Date.now() < deadline) {
+    while ((this.queue.length > 0 || this.isFlushing) && Date.now() < deadline) {
       const remaining = deadline - Date.now();
       const budget = this.delay(remaining);
       try {
@@ -742,6 +760,8 @@ export class Datalyr {
         }
       }
     }
+
+    this.closeFinished = true;
 
     // review M2: stop leaking the beforeExit listener (+ the instance/queue it pins).
     if (this.exitHook) {

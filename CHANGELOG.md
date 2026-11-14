@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-11-14
+
+### Fixed
+- **`flush()` and `close()` returned while a send was still in flight.** `flush()` returned
+  on an empty queue before checking for a running drain, and a drain empties the queue as
+  soon as it starts. So once an auto-flush (queue reached `flushAt`) had taken the events,
+  `await flush()` and `await close()` resolved in ~0 ms while the POST and its retries were
+  still running, and `onDrop` for those events fired after `close()` had returned. A
+  serverless handler that hit `flushAt` (or used `flushAt: 1`) could return and freeze
+  with sends in flight. `flush()` now awaits a running drain even when the queue is empty,
+  and `close()` keeps waiting, within `closeTimeout`, while a drain is running. On a shared
+  instance this means `await flush()` can now take as long as an in-flight send's retries,
+  including sends for other callers' events.
+- **A send that failed after `close()` gave up was lost without an `onDrop`.** A send still
+  running when `closeTimeout` expired was re-queued on a retryable failure, onto a closed
+  client that never drains again. It now goes to `onDrop(events, 'close_timeout')`.
+
 ## [1.3.3] - 2026-09-03
 
 ### Added

@@ -353,7 +353,9 @@ await datalyr.close();   // once, at process shutdown
 `flush()` drains the whole queue and resolves once every event is sent, or once a pass
 delivers nothing against a down endpoint. It loops, so events enqueued during a flush are
 also sent. When a drain is already running, `flush()` awaits that drain instead of
-starting a second one.
+starting a second one. That includes a drain started by reaching `flushAt`, even though
+the queue is already empty by then. Before 1.3.4, `flush()` returned at once in that case
+with the sends still in flight.
 
 Use `flush()` in serverless handlers, where the instance can freeze the moment you return.
 
@@ -368,8 +370,9 @@ export async function handler(event) {
 
 ### close()
 
-`close()` stops the flush timer, then drains the queue until it is empty or `closeTimeout`
-expires. It is terminal and idempotent: repeat and concurrent calls share one drain.
+`close()` stops the flush timer, then drains the queue, and waits for any send already in
+flight, until both are done or `closeTimeout` expires. It is terminal and idempotent:
+repeat and concurrent calls share one drain.
 
 > **Call `close()` only at process shutdown.** A `track()` call after `close()` is dropped
 > with reason `closed`, and the SDK logs one loud error.
@@ -381,7 +384,10 @@ process.on('SIGTERM', async () => {
 });
 ```
 
-Events still queued when the budget expires go to `onDrop(events, 'close_timeout')`.
+Events still queued when the budget expires go to `onDrop(events, 'close_timeout')`. A
+send still running at that moment keeps going in the background, so its result arrives
+after `close()` has returned: it is delivered, or `onDrop` fires for it then
+(`close_timeout` for a retryable failure, `permanent_client_error` for a 4xx).
 
 The SDK also registers a `beforeExit` hook that calls `flush()` best-effort. That hook
 does not replace `await close()`.

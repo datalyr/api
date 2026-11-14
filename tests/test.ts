@@ -259,6 +259,49 @@ async function main() {
     `9.D.6: NaN/non-number/missing value each dropped (got ${dropsTP.filter((r) => r === 'validation_error').length})`);
   await dlTP.close();
 
+  // ---- DLR-8: close() waits for a send an auto-flush already took (queue empty, POST in flight) ----
+  (globalThis as any).fetch = async () => {
+    await new Promise((r) => setTimeout(r, 500));
+    return { ok: false, status: 400, statusText: 'Bad Request', text: async () => 'nope' };
+  };
+  const drops8: string[] = [];
+  const dl8 = new Datalyr({ apiKey: 'dk_test', flushAt: 1, flushInterval: 3_600_000, onDrop: (_e, r) => drops8.push(r) });
+  await dl8.track({ userId: 'u', event: 'in_flight' }); // flushAt:1 → auto-flush empties the queue
+  const t8 = Date.now();
+  await dl8.close();
+  const el8 = Date.now() - t8;
+  assert(el8 >= 400, `DLR-8: close() waits for the in-flight send (resolved after ${el8}ms, send takes 500ms)`);
+  assert(drops8.length === 1 && drops8[0] === 'permanent_client_error',
+    `DLR-8: onDrop('permanent_client_error') fires BEFORE close() resolves (got ${JSON.stringify(drops8)})`);
+
+  // ---- DLR-8: flush() also waits for an in-flight auto-flush instead of returning on an empty queue ----
+  const sent8b: any[] = [];
+  (globalThis as any).fetch = async (_url: string, opts: any) => {
+    await new Promise((r) => setTimeout(r, 300));
+    sent8b.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, statusText: 'OK', text: async () => '', json: async () => ({}) };
+  };
+  const dl8b = new Datalyr({ apiKey: 'dk_test', flushAt: 1, flushInterval: 3_600_000 });
+  await dl8b.track({ userId: 'u', event: 'flushed_in_flight' });
+  await dl8b.flush();
+  assert(sent8b.some((e) => e.event === 'flushed_in_flight'),
+    'DLR-8: await flush() resolves only after the auto-flushed event has been delivered');
+  await dl8b.close();
+
+  // ---- DLR-8 review: a send that fails transiently AFTER close() gave up reaches onDrop ----
+  (globalThis as any).fetch = async () => {
+    await new Promise((r) => setTimeout(r, 1500));
+    return { ok: false, status: 503, statusText: 'down', text: async () => '' };
+  };
+  const drops8c: string[] = [];
+  const dl8c = new Datalyr({ apiKey: 'dk_test', flushAt: 1, flushInterval: 3_600_000, retryLimit: 0, closeTimeout: 1000, onDrop: (_e, r) => drops8c.push(r) });
+  await dl8c.track({ userId: 'u', event: 'late_503' });
+  await dl8c.close(); // budget (1s) expires while the 1.5s send is still running
+  assert(drops8c.length === 0, `DLR-8: nothing dropped yet when close() gives up mid-send (got ${JSON.stringify(drops8c)})`);
+  await new Promise((r) => setTimeout(r, 1000)); // let the late 503 land
+  assert(drops8c.length === 1 && drops8c[0] === 'close_timeout',
+    `DLR-8: a late transient failure after close() fires onDrop('close_timeout') instead of stranding (got ${JSON.stringify(drops8c)})`);
+
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

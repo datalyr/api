@@ -139,46 +139,39 @@ async function main() {
     advance(60_000);
     await dl.flush();
     assert(calls === 1, `Retry-After: still not retried 60 s later (attempts ${calls})`);
-    advance(61_000);
+    advance(90_000); // 150 s in all: past 120 s plus up to 20% jitter
     const r2: any = await dl.flush();
-    assert(accepted === 1 && r2 && r2.unsent === 0, `Retry-After: sent once the 120 s pass (accepted ${accepted}, ${JSON.stringify(r2)})`);
+    assert(accepted === 1 && r2 && r2.unsent === 0, `Retry-After: sent once the 120 s (plus jitter) pass (accepted ${accepted}, ${JSON.stringify(r2)})`);
     await dl.close();
   }
 
-  // ---- 401/403 are kept for 10 minutes (a key check can fail for a moment), then dropped ----
+  // ---- 401/403 are final (the server answers 503 for its own faults): sent once, dropped, counted ----
   {
-    let calls = 0;
-    (globalThis as any).fetch = async () => { calls++; return answer(401); };
-    const drops: string[] = [];
-    const dl = new Datalyr({ ...base, retryLimit: 3, onDrop: (_e, r) => drops.push(r) });
-    await dl.track({ userId: 'u', event: 'auth_blip' });
-    await dl.flush();
-    assert(calls === 1 && drops.length === 0, `401: sent once per cycle and kept, not dropped (attempts ${calls}, drops ${JSON.stringify(drops)})`);
-    advance(5 * 60_000);
-    await dl.flush();
-    assert(calls === 2 && drops.length === 0, `401: still kept after 5 minutes (attempts ${calls}, drops ${JSON.stringify(drops)})`);
-    advance(6 * 60_000);
-    await dl.flush();
-    assert(drops.length === 1 && drops[0] === 'permanent_client_error',
-      `401: dropped as permanent_client_error once 10 minutes have passed (drops ${JSON.stringify(drops)})`);
-    assert((dl as any).getStats?.().droppedByReason?.permanent_client_error === 1, '401: the drop is counted');
-    await dl.close();
-
-    // A 403 that clears: delivered with the same id.
-    const ids: string[] = [];
-    (globalThis as any).fetch = async (_u: string, opts: any) => {
-      ids.push(JSON.parse(opts.body).eventId);
-      return ids.length === 1 ? answer(403) : answer(200);
-    };
-    const drops2: string[] = [];
-    const dl2 = new Datalyr({ ...base, onDrop: (_e, r) => drops2.push(r) });
-    await dl2.track({ userId: 'u', event: 'auth_recovers' });
-    await dl2.flush();
-    advance(61_000);
-    await dl2.flush();
-    assert(ids.length === 2 && ids[0] === ids[1] && drops2.length === 0,
-      `403 then 200: delivered on the retry with the same id, nothing dropped (attempts ${ids.length})`);
-    await dl2.close();
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: any[]) => { warnings.push(args.join(' ')); };
+    try {
+      for (const status of [401, 403]) {
+        let calls = 0;
+        (globalThis as any).fetch = async () => { calls++; return answer(status); };
+        const drops: string[] = [];
+        const dl = new Datalyr({ ...base, retryLimit: 3, onDrop: (_e, r) => drops.push(r) });
+        await dl.track({ userId: 'u', event: 'auth_' + status + '_a' });
+        await dl.track({ userId: 'u', event: 'auth_' + status + '_b' });
+        await dl.flush();
+        advance(61_000);
+        await dl.flush();
+        assert(calls === 2 && drops.length === 2 && drops.every((r) => r === 'auth_refused'),
+          `${status}: final, each event sent once and dropped as auth_refused (attempts ${calls}, drops ${JSON.stringify(drops)})`);
+        const st = (dl as any).getStats?.();
+        assert(st?.droppedByReason?.auth_refused === 2, `${status}: counted under auth_refused (got ${JSON.stringify(st?.droppedByReason)})`);
+        await dl.close();
+      }
+      const authLines = warnings.filter((w) => /auth_refused=2/.test(w));
+      assert(authLines.length === 2, `one summary line per client for its auth drops, not one per event (got ${JSON.stringify(authLines)})`);
+    } finally {
+      console.warn = realWarn;
+    }
   }
 
   // ---- Final answers drop at once: 400 and 413 are sent once and never again ----
@@ -198,6 +191,92 @@ async function main() {
     }
   }
 
+  // ---- A long outage with a steady sender never holds more than maxQueueSize; every eviction counted ----
+  {
+    let peak = 0, calls = 0;
+    let dlRef: any;
+    (globalThis as any).fetch = async () => {
+      calls++;
+      const st = dlRef.getStats();
+      peak = Math.max(peak, st.queued + st.inFlight);
+      return answer(503);
+    };
+    const realWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const dl = new Datalyr({ ...base, flushAt: 20, maxQueueSize: 100, retryLimit: 0 });
+      dlRef = dl;
+      let tracked = 0, worst = 0;
+      for (let round = 0; round < 30; round++) {
+        for (let i = 0; i < 20; i++) { await dl.track({ userId: 'u', event: `steady_${round}_${i}` }); tracked++; }
+        await dl.flush();
+        const st = (dl as any).getStats();
+        worst = Math.max(worst, st.queued + st.inFlight);
+        advance(61_000);
+      }
+      const st = (dl as any).getStats();
+      assert(worst <= 100 && peak <= 100,
+        `steady sender, 30-minute 503 outage: queued + in flight never above the cap of 100 (worst after a flush ${worst}, peak during sends ${peak})`);
+      assert(st.droppedByReason.queue_overflow + st.queued + st.inFlight === tracked && st.dropped === st.droppedByReason.queue_overflow,
+        `every event is either held or counted as queue_overflow (${tracked} tracked, ${st.queued + st.inFlight} held, ${st.droppedByReason.queue_overflow} evicted)`);
+      await dl.close();
+    } finally {
+      console.warn = realWarn;
+    }
+  }
+
+  // ---- Temporary failures longer than maxRetryDuration: dropped as max_flush_attempts, counted ----
+  {
+    let calls = 0;
+    (globalThis as any).fetch = async () => { calls++; return answer(503); };
+    const drops: string[] = [];
+    const dl = new Datalyr({ ...base, retryLimit: 0, maxRetryDuration: 60_000, onDrop: (_e, r) => drops.push(r) } as any);
+    await dl.track({ userId: 'u', event: 'expires' });
+    await dl.flush();
+    advance(30_000);
+    await dl.flush();
+    assert(drops.length === 0, `maxRetryDuration: still kept after 30 s of a 60 s window (drops ${JSON.stringify(drops)})`);
+    advance(31_000);
+    await dl.flush();
+    assert(calls === 3 && drops.length === 1 && drops[0] === 'max_flush_attempts',
+      `maxRetryDuration: dropped as max_flush_attempts once the window passed (attempts ${calls}, drops ${JSON.stringify(drops)})`);
+    assert((dl as any).getStats().droppedByReason.max_flush_attempts === 1, 'maxRetryDuration: the drop is counted');
+    await dl.close();
+  }
+
+  // ---- A malformed Retry-After is ignored: normal backoff, then delivered ----
+  {
+    const stamps: number[] = [];
+    (globalThis as any).fetch = async () => {
+      stamps.push(realNow());
+      return stamps.length === 1 ? answer(503, { 'Retry-After': 'soon' }) : answer(200);
+    };
+    const dl = new Datalyr({ ...base, retryLimit: 1 });
+    await dl.track({ userId: 'u', event: 'retry_after_bad' });
+    const r: any = await dl.flush();
+    const gap = stamps.length >= 2 ? stamps[1] - stamps[0] : -1;
+    assert(stamps.length === 2 && gap >= 400 && gap < 1500 && r.unsent === 0,
+      `Retry-After: soon is ignored: retried after the normal 0.5-1 s backoff and delivered (gap ${gap} ms, ${JSON.stringify(r)})`);
+    await dl.close();
+  }
+
+  // ---- close() waits out a backoff (Retry-After: 2) and delivers instead of dropping ----
+  {
+    const stamps: number[] = [];
+    (globalThis as any).fetch = async () => {
+      stamps.push(realNow());
+      return stamps.length === 1 ? answer(503, { 'Retry-After': '2' }) : answer(200);
+    };
+    const drops: string[] = [];
+    const dl = new Datalyr({ ...base, retryLimit: 0, closeTimeout: 10_000, onDrop: (_e, r) => drops.push(r) });
+    await dl.track({ userId: 'u', event: 'close_waits' });
+    await dl.flush();
+    const c: any = await dl.close();
+    const gap = stamps.length >= 2 ? stamps[1] - stamps[0] : -1;
+    assert(stamps.length === 2 && gap >= 1950 && c.unsent === 0 && drops.length === 0,
+      `close() waits out the 2 s Retry-After, then delivers (gap ${gap} ms, ${JSON.stringify(c)}, drops ${JSON.stringify(drops)})`);
+  }
+
   // ---- The queue cap: drops are counted, readable, and logged as ONE summary line ----
   {
     (globalThis as any).fetch = () => new Promise(() => {}); // a send that never settles
@@ -206,21 +285,22 @@ async function main() {
     console.warn = (...args: any[]) => { warnings.push(args.join(' ')); };
     const dl = new Datalyr({ ...base, maxQueueSize: 100, timeout: 1000, flushTimeout: 1000, closeTimeout: 1000 } as any);
     try {
-      // The first 100 are taken by the auto-flush (stuck in flight); 260 more refill a 100 cap.
+      // The first 100 are taken by the auto-flush (stuck in flight). Queued + in flight is
+      // already at the cap of 100 and nothing is queued to evict, so the 260 that follow are dropped.
       for (let i = 0; i < 360; i++) void dl.track({ userId: 'u', event: 'e' + i });
       const t0 = realNow();
       const res = await within(dl.flush() as Promise<any>, 4000);
       const elapsed = realNow() - t0;
       assert(res.done && elapsed < 2500, `flush() returns within flushTimeout while sends hang (${res.done ? elapsed + ' ms' : 'did not return in 4 s'})`);
-      assert(res.done && res.value && res.value.unsent === 200,
-        `flush() says how many are unsent: 100 queued + 100 in flight (got ${JSON.stringify(res.value)})`);
+      assert(res.done && res.value && res.value.unsent === 100,
+        `flush() says how many are unsent: 100 in flight (got ${JSON.stringify(res.value)})`);
       const stats = (dl as any).getStats?.();
-      assert(!!stats && stats.droppedByReason.queue_overflow === 160 && stats.dropped === 160,
-        `getStats() counts the 160 events the cap dropped (got ${JSON.stringify(stats)})`);
-      assert(!!stats && stats.queued === 100 && stats.inFlight === 100,
-        `getStats() shows 100 queued and 100 in flight (got ${stats && JSON.stringify({ q: stats.queued, f: stats.inFlight })})`);
+      assert(!!stats && stats.droppedByReason.queue_overflow === 260 && stats.dropped === 260,
+        `getStats() counts the 260 events the cap dropped (got ${JSON.stringify(stats)})`);
+      assert(!!stats && stats.queued === 0 && stats.inFlight === 100,
+        `getStats() shows 0 queued and 100 in flight (got ${stats && JSON.stringify({ q: stats.queued, f: stats.inFlight })})`);
       const capLines = warnings.filter((w) => /queue/i.test(w) && /dropped/i.test(w));
-      assert(capLines.length === 1 && capLines[0].includes('160'),
+      assert(capLines.length === 1 && capLines[0].includes('260'),
         `one summary line for the cap, with the count, never one per event (got ${JSON.stringify(capLines)})`);
       // Nothing new dropped: the next report says nothing.
       await within(dl.flush() as Promise<any>, 4000);
@@ -229,8 +309,8 @@ async function main() {
 
       // close() is bounded too and says how many it could not send.
       const c = await within(dl.close() as Promise<any>, 4000);
-      assert(c.done && c.value && c.value.unsent === 200,
-        `close() returns within closeTimeout and says 200 left unsent (got ${JSON.stringify(c.value)})`);
+      assert(c.done && c.value && c.value.unsent === 100,
+        `close() returns within closeTimeout and says 100 left unsent (got ${JSON.stringify(c.value)})`);
     } finally {
       console.warn = realWarn;
     }

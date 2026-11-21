@@ -418,8 +418,9 @@ const datalyr = new Datalyr({
 | `reason` | Cause |
 | --- | --- |
 | `validation_error` | A missing event name, `userId`, `newUserId`, or `groupId`, or a non-finite purchase `value` |
-| `queue_overflow` | The queue reached `maxQueueSize`. The oldest event was evicted. |
-| `permanent_client_error` | A final `4xx` (any `4xx` except `401`, `403`, `408`, `429`) at once; `401`/`403` after 10 minutes of refusals |
+| `queue_overflow` | Queued plus in-flight events reached `maxQueueSize`. The oldest queued event was evicted, or the new one when every held event was in flight. |
+| `permanent_client_error` | A final `4xx` other than `401`/`403` (`400`, `413`, ...) |
+| `auth_refused` | `401` or `403`: the API key was refused |
 | `max_flush_attempts` | Temporary failures for longer than `maxRetryDuration` (default 1 hour). The name is kept from earlier versions. |
 | `close_timeout` | `close()` ran out of time |
 | `closed` | `track()` ran after `close()` |
@@ -451,8 +452,8 @@ flight at once.
 | Backoff between failed cycles | `min(2^(n-1) × 1000, 60000)` ms, jittered, and never before `Retry-After` |
 | `Retry-After` | Honoured on any answer, as seconds or an HTTP date, capped at 5 minutes |
 | Request timeout | `timeout`, default 10,000 ms, through `AbortController` |
-| Queue | `maxQueueSize`, default 1000. The oldest event is dropped first. |
-| Retry window per event | `maxRetryDuration`, default 1 hour (10 minutes for `401`/`403`) |
+| Queue | `maxQueueSize`, default 1000, counting queued plus in-flight events, including events waiting to be retried. The oldest queued event is dropped first. |
+| Retry window per event | `maxRetryDuration`, default 1 hour |
 | Drain passes per flush | 12 |
 | `flush()` budget | `flushTimeout`, default 30,000 ms |
 | `close()` budget | `closeTimeout`, default 30,000 ms |
@@ -464,9 +465,9 @@ flight at once.
 | Response | Behavior |
 | --- | --- |
 | `2xx` | Success. A duplicate of an `eventId` the server already has is a `200` too. Never sent again. |
-| `408`, `429`, any `5xx` (including `503`) | Kept. Retried with jittered exponential backoff, waiting at least `Retry-After` when the server sends it. |
-| `401`, `403` | Kept and retried for 10 minutes, then dropped. The SDK logs an authentication failure once. |
-| Other `4xx` (`400`, `413`, ...) | Final. Dropped immediately. Never retried. |
+| `408`, `429`, any `5xx` (including `503`) | Kept. Retried with jittered exponential backoff, waiting at least `Retry-After` (plus up to 20% jitter) when the server sends it. |
+| `401`, `403` | Final. Dropped as `auth_refused`. The SDK logs an authentication failure once. |
+| Other `4xx` (`400`, `413`, ...) | Final. Dropped immediately as `permanent_client_error`. Never retried. |
 | Network, DNS, TLS, timeout | Kept. Retried like a `5xx`. |
 
 Every retry sends the same event, with the same `eventId`, so the server stores it once.

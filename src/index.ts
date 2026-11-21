@@ -3,8 +3,9 @@ import { randomUUID, createHash } from 'node:crypto';
 /** Why an event was dropped, passed to the onDrop hook (9.D.7). */
 export type DropReason =
   | 'validation_error'   // track/identify/alias/group called with invalid args (9.D.4)
-  | 'queue_overflow'     // maxQueueSize reached; oldest evicted (NODE-5)
-  | 'permanent_client_error' // a final 4xx (400, 413, ...) at once; 401/403 after AUTH_RETRY_WINDOW_MS (FX-047)
+  | 'queue_overflow'     // queued + in flight reached maxQueueSize; oldest queued evicted (NODE-5, FX-047)
+  | 'permanent_client_error' // a final 4xx other than 401/403 (400, 413, ...), dropped at once
+  | 'auth_refused'       // 401/403: the key was refused (final; counted apart from other 4xx, FX-047)
   | 'max_flush_attempts' // temporary failures lasted longer than maxRetryDuration (FX-047; the name is kept for compatibility)
   | 'close_timeout'      // still queued when close()'s closeTimeout budget expired (NODE-1)
   | 'closed';            // track() called after close() (9.D.3)
@@ -55,7 +56,7 @@ export interface TrackOptions {
   anonymousId?: string;
   event: string;
   properties?: Record<string, any>;
-  /** Idempotency key for this event. The ingest server de-duplicates on it (6h window),
+  /** Idempotency key for this event. The ingest server de-duplicates on it (7-day window),
    *  so pass a stable id from your source system — e.g. the Stripe webhook `event.id` —
    *  and at-least-once webhook redeliveries won't double-count. Must be a non-empty
    *  string; anything else is ignored (a random UUID is generated, as when omitted). */
@@ -124,11 +125,10 @@ const MAX_DRAIN_PASSES = 12;
 
 // FX-047: what the ingest worker's answers mean (datalyr-v2 infra/cloudflare/ingest,
 // handleServerTrack). 2xx = stored (or a duplicate of an id it already has). 400, 405, 413,
-// 415 = this exact request can never succeed: final. 401/403 = a key a healthy lookup refused;
-// final in principle, but a key check can fail for a moment, so they are kept for
-// AUTH_RETRY_WINDOW_MS. 408, 429, every 5xx (503 + Retry-After is the worker's "my own fault,
-// send it again"), a timeout or a network error = temporary: keep the event and retry.
-const AUTH_RETRY_WINDOW_MS = 10 * 60_000;
+// 415 = this exact request can never succeed: final. 401/403 = a key a healthy lookup refused:
+// final too, because the worker answers 503 (not 401) when its own key check fails
+// (INGEST_OWN_FAULT_503). 408, 429, every 5xx (503 + Retry-After is the worker's "my own
+// fault, send it again"), a timeout or a network error = temporary: keep the event and retry.
 // Backoff between failed cycles for one event: 1s, 2s, 4s ... capped at 60s, jittered.
 const MAX_CYCLE_BACKOFF_MS = 60_000;
 // A Retry-After longer than this is not waited out inside one send's quick retries; the event
@@ -138,11 +138,16 @@ const MAX_INLINE_WAIT_MS = 10_000;
 const MAX_RETRY_AFTER_MS = 5 * 60_000;
 
 const ALL_DROP_REASONS: DropReason[] = [
-  'validation_error', 'queue_overflow', 'permanent_client_error', 'max_flush_attempts', 'close_timeout', 'closed',
+  'validation_error', 'queue_overflow', 'permanent_client_error', 'auth_refused', 'max_flush_attempts', 'close_timeout', 'closed',
 ];
 // Reasons the periodic summary line reports. The others already log at the call
 // (validation_error, closed) or in close()'s own line (close_timeout).
-const SUMMARY_REASONS: DropReason[] = ['queue_overflow', 'permanent_client_error', 'max_flush_attempts'];
+const SUMMARY_REASONS: DropReason[] = ['queue_overflow', 'permanent_client_error', 'auth_refused', 'max_flush_attempts'];
+
+// Spread retries that a Retry-After would otherwise line up on the same instant.
+function jitterUp(ms: number): number {
+  return ms * (1 + Math.random() * 0.2);
+}
 
 /** Retry-After as milliseconds: delta-seconds or an HTTP date; undefined when absent or unreadable. */
 function parseRetryAfterMs(value: string | null | undefined): number | undefined {
@@ -159,9 +164,9 @@ function parseRetryAfterMs(value: string | null | undefined): number | undefined
   return Math.min(Math.max(0, ms), MAX_RETRY_AFTER_MS);
 }
 
-/** A 4xx the server means as final (everything except 401/403, 408 and 429). */
+/** A 4xx the server means as final (everything except 408 and 429). */
 function isFinalStatus(status: number): boolean {
-  return status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 408 && status !== 429;
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 interface RetryState {
@@ -198,6 +203,8 @@ export class Datalyr {
   private warnedAuthFailure = false;     // one-time loud error for 401/403 (9.D.8)
   private retryState = new WeakMap<TrackEvent, RetryState>(); // FX-047: per-event retry clock; WeakMap → no payload pollution
   private inFlight = 0;                  // FX-047: events taken from the queue by a pass and not settled yet
+  private nextSeq = 0;                   // FX-047: arrival order, so the cap always evicts the oldest
+  private seqOf = new WeakMap<TrackEvent, number>();
   private droppedByReason: Record<DropReason, number> = Object.fromEntries(ALL_DROP_REASONS.map((r) => [r, 0])) as Record<DropReason, number>;
   private reportedByReason: Record<DropReason, number> = Object.fromEntries(ALL_DROP_REASONS.map((r) => [r, 0])) as Record<DropReason, number>;
   private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
@@ -374,7 +381,7 @@ export class Datalyr {
       ...(providedExternalIds && typeof providedExternalIds === 'object'
         ? { externalIds: providedExternalIds } : {}),
       // 9.D.1: honor a caller-supplied eventId VERBATIM — it is the ingest server's dedup
-      // key (6h window), so webhook handlers can pass the source event id (e.g. Stripe
+      // key (7-day window), so webhook handlers can pass the source event id (e.g. Stripe
       // `event.id`) and at-least-once redeliveries no longer double-count revenue. A fresh
       // uuid per call (the old unconditional behavior) made every redelivery look new.
       eventId: this.resolveEventId(providedEventId),
@@ -529,12 +536,16 @@ export class Datalyr {
   }
 
   private enqueue(event: TrackEvent): void {
-    // Check queue size limit to prevent memory issues. NODE-5 / FX-047: every eviction is
-    // counted (getStats()) and reported as ONE summary line per flush cycle, never per event.
-    if (this.queue.length >= this.maxQueueSize) {
-      const dropped = this.queue.shift(); // Remove oldest event
-      // 9.D.7: overflow is a drop path — surface it so callers can persist to their own DLQ.
-      if (dropped) this.notifyDrop([dropped], 'queue_overflow');
+    // Memory cap. NODE-5 / FX-047: queued + in flight never exceeds maxQueueSize. The oldest
+    // QUEUED event is evicted; when every held event is in flight, the new one is dropped.
+    // Every eviction is counted (getStats()) and reported as ONE summary line per flush
+    // cycle, never per event. 9.D.7: each also reaches onDrop.
+    this.seqOf.set(event, this.nextSeq++);
+    if (this.queue.length + this.inFlight >= this.maxQueueSize) {
+      const dropped = this.queue.length > 0 ? this.queue.shift()! : event;
+      this.retryState.delete(dropped);
+      this.notifyDrop([dropped], 'queue_overflow');
+      if (dropped === event) return;
     }
 
     this.queue.push(event);
@@ -677,13 +688,14 @@ export class Datalyr {
     for (let i = 0; i < events.length; i += batchSize) {
       const batch = events.slice(i, i + batchSize);
       const promises = batch.map(event =>
-        this.sendEvent(event)
-          .then(() => { this.retryState.delete(event); })
-          .catch((err: any) => {
+        this.sendEvent(event).then(
+          () => { this.inFlight--; this.retryState.delete(event); },
+          (err: any) => {
+            // Settled: no longer in flight before the keep/drop decision (the cap counts it again if kept).
+            this.inFlight--;
             failed++;
             this.handleFailure(event, err);
           })
-          .finally(() => { this.inFlight--; })
       );
       await Promise.allSettled(promises);
     }
@@ -701,10 +713,19 @@ export class Datalyr {
     // 9.D.7: every send failure reaches onError before any drop/requeue decision.
     this.notifyError(event, err instanceof Error ? err : new Error(String(err)));
 
-    // A final 4xx (malformed, too large, wrong method) can never succeed: drop at once.
+    // A final 4xx (malformed, too large, wrong method, refused key) can never succeed: drop at once.
     if (err && err.permanent) {
       this.retryState.delete(event);
-      this.notifyDrop([event], 'permanent_client_error');
+      if (err.auth) {
+        // 9.D.8: a wrong key black-holes everything; say so loudly, once.
+        if (!this.warnedAuthFailure) {
+          this.warnedAuthFailure = true;
+          console.error(`[Datalyr] Authentication failing (HTTP ${err.status}) — check your API key ("dk_..."). Events are being dropped.`);
+        }
+        this.notifyDrop([event], 'auth_refused');
+      } else {
+        this.notifyDrop([event], 'permanent_client_error');
+      }
       return;
     }
 
@@ -720,18 +741,7 @@ export class Datalyr {
     const state = this.retryState.get(event) ?? { firstFailedAt: now, failures: 0, notBefore: 0 };
     state.failures++;
 
-    if (err && err.auth) {
-      // 9.D.8: a wrong key black-holes everything; say so loudly, once.
-      if (!this.warnedAuthFailure) {
-        this.warnedAuthFailure = true;
-        console.error(`[Datalyr] Authentication failing (HTTP ${err.status}) — check your API key ("dk_..."). Events are kept and retried for ${AUTH_RETRY_WINDOW_MS / 60_000} minutes, then dropped.`);
-      }
-      if (now - state.firstFailedAt >= Math.min(AUTH_RETRY_WINDOW_MS, this.maxRetryDuration)) {
-        this.retryState.delete(event);
-        this.notifyDrop([event], 'permanent_client_error');
-        return;
-      }
-    } else if (now - state.firstFailedAt >= this.maxRetryDuration) {
+    if (now - state.firstFailedAt >= this.maxRetryDuration) {
       this.retryState.delete(event);
       this.notifyDrop([event], 'max_flush_attempts');
       return;
@@ -740,11 +750,20 @@ export class Datalyr {
     // Back off before this event is sent again: 1s, 2s, 4s ... 60s with jitter, and never
     // before the time a Retry-After named.
     const backoff = Math.min(1000 * Math.pow(2, state.failures - 1), MAX_CYCLE_BACKOFF_MS) * (0.5 + Math.random() * 0.5);
-    const retryAfter = typeof err?.retryAfterMs === 'number' ? err.retryAfterMs : 0;
+    const retryAfter = typeof err?.retryAfterMs === 'number' ? jitterUp(err.retryAfterMs) : 0;
     state.notBefore = now + Math.max(backoff, retryAfter);
     this.retryState.set(event, state);
-    // Back at the front so the oldest failures go first.
-    this.queue.unshift(event);
+    // Back in arrival order, so the oldest go first and the cap evicts the oldest.
+    const seq = this.seqOf.get(event) ?? -1;
+    let at = this.queue.length;
+    while (at > 0 && (this.seqOf.get(this.queue[at - 1]) ?? -1) > seq) at--;
+    this.queue.splice(at, 0, event);
+    // FX-047: a re-queued event counts against the cap like a new one.
+    while (this.queue.length + this.inFlight > this.maxQueueSize && this.queue.length > 0) {
+      const evicted = this.queue.shift()!;
+      this.retryState.delete(evicted);
+      this.notifyDrop([evicted], 'queue_overflow');
+    }
   }
 
   private async sendEvent(event: TrackEvent, retryCount = 0): Promise<void> {
@@ -782,13 +801,7 @@ export class Datalyr {
           const err: any = new Error(`Client error: ${status} ${response.statusText} - ${errorText}`);
           err.status = status;
           err.permanent = true;
-          throw err;
-        }
-        // 401/403: no quick retries; the flush layer keeps the event for AUTH_RETRY_WINDOW_MS.
-        if (status === 401 || status === 403) {
-          const err: any = new Error(`Authentication error: ${status} ${response.statusText} - ${errorText}`);
-          err.status = status;
-          err.auth = true;
+          err.auth = status === 401 || status === 403; // dropped as auth_refused
           throw err;
         }
         // 408 / 429 / 5xx: temporary.
@@ -808,8 +821,8 @@ export class Datalyr {
         }
       }
     } catch (error: any) {
-      // Final answers and auth failures are decided by the flush layer, not retried here.
-      if (error && (error.permanent || error.auth)) {
+      // Final answers are decided by the flush layer, never retried here.
+      if (error && error.permanent) {
         if (this.debug) {
           console.error('[Datalyr] Not retrying now:', error.message);
         }
@@ -829,7 +842,7 @@ export class Datalyr {
         // recovering server; FX-047: never sooner than the server's Retry-After.
         const backoffMs = Math.min(Math.pow(2, retryCount) * 1000, 10000); // Max 10s
         const jittered = backoffMs * (0.5 + Math.random() * 0.5);
-        await new Promise(resolve => setTimeout(resolve, Math.max(jittered, retryAfterMs ?? 0)));
+        await new Promise(resolve => setTimeout(resolve, Math.max(jittered, retryAfterMs === undefined ? 0 : jitterUp(retryAfterMs))));
         return this.sendEvent(event, retryCount + 1);
       }
 

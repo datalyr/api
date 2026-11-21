@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Events were deleted during a server outage.** An event that failed with a temporary
+  error (`5xx`, `503`, `429`, `408`, a timeout or a network error) was dropped after 10
+  failed flush cycles, about two minutes at the default settings. It is now kept and
+  retried for `maxRetryDuration` (new, default 1 hour), with backoff of up to 60 s between
+  cycles. Every retry carries the same `eventId`, and an event the server accepted (`2xx`)
+  is never sent again.
+- **`Retry-After` was ignored.** The server answers `503` and `429` with `Retry-After`; the
+  SDK now waits at least that long (seconds or an HTTP date, capped at 5 minutes).
+- **`401`/`403` deleted events at once.** A key check that fails for a moment now costs
+  nothing: the event is kept and retried for 10 minutes, then dropped as
+  `permanent_client_error`. Other `4xx` answers (`400`, `413`, ...) are still final.
+- **`flush()` had no time bound** and could wait through every retry of every event. It now
+  waits at most `flushTimeout` (new, default 30 s).
+
+### Added
+- `getStats()`: queued, in-flight and dropped counts, by drop reason.
+- `flush()` and `close()` resolve with `{ unsent }`, the number of events not delivered when
+  they returned, and log one line when it is above zero.
+- Drops (queue cap, final answers, expired retries) are logged as one summary line per flush
+  cycle instead of a first-overflow warning and a line per expired event.
+
 ## [1.3.4] - 2026-11-14
 
 ### Fixed

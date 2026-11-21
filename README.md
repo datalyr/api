@@ -88,6 +88,8 @@ const datalyr = new Datalyr({
   retryLimit: 3,
   maxQueueSize: 1000,
   closeTimeout: 30000,
+  flushTimeout: 30000,
+  maxRetryDuration: 3600000,
   onError: (event, error) => console.error(event.event, error),
   onDrop: (events, reason) => console.error(reason, events.length),
 });
@@ -108,6 +110,8 @@ Every numeric option is clamped. A value outside its range becomes the nearest b
 | `retryLimit` | `number` | `3` | retries | 0–10 |
 | `maxQueueSize` | `number` | `1000` | events | 100–10000 |
 | `closeTimeout` | `number` | `30000` | milliseconds | 1000–120000 |
+| `flushTimeout` | `number` | `30000` | milliseconds | 1000–120000 |
+| `maxRetryDuration` | `number` | `3600000` | milliseconds | 60000–86400000 |
 | `debug` | `boolean` | `false` | — | — |
 | `onError` | `(event: TrackEvent, error: Error) => void` | Unset | — | — |
 | `onDrop` | `(events: TrackEvent[], reason: DropReason) => void` | Unset | — | — |
@@ -128,8 +132,9 @@ Every option above is read by the SDK. None is dead.
 | `page` | `(userId: string, name?: string, properties?: any, anonymousId?: string) => Promise<void>` |
 | `group` | `(userId: string, groupId: string, traits?: any, anonymousId?: string) => Promise<void>` |
 | `trackPurchase` | `(userId: string \| null, purchase: PurchaseProperties, opts?: { anonymousId?: string; eventId?: string; timestamp?: string \| Date \| number }) => Promise<void>` |
-| `flush` | `() => Promise<void>` |
-| `close` | `() => Promise<void>` |
+| `flush` | `() => Promise<FlushResult>` — `{ unsent: number }` |
+| `close` | `() => Promise<FlushResult>` — `{ unsent: number }` |
+| `getStats` | `() => DatalyrStats` — `{ queued, inFlight, dropped, droppedByReason }` |
 | `getAnonymousId` | `() => string` |
 
 ## Identity
@@ -350,9 +355,11 @@ await datalyr.close();   // once, at process shutdown
 
 ### flush()
 
-`flush()` drains the whole queue and resolves once every event is sent, or once a pass
-delivers nothing against a down endpoint. It loops, so events enqueued during a flush are
-also sent. When a drain is already running, `flush()` awaits that drain instead of
+`flush()` sends the queue and resolves once every event is sent, once a pass delivers
+nothing against a down endpoint, or once `flushTimeout` (default 30,000 ms) has passed,
+whichever comes first. It resolves with `{ unsent }`: the events still queued or in
+flight. Those are kept and retried later, not dropped, and one log line says how many. It
+loops, so events enqueued during a flush are also sent. When a drain is already running, `flush()` awaits that drain instead of
 starting a second one. That includes a drain started by reaching `flushAt`, even though
 the queue is already empty by then. Before 1.3.4, `flush()` returned at once in that case
 with the sends still in flight.
@@ -384,10 +391,11 @@ process.on('SIGTERM', async () => {
 });
 ```
 
-Events still queued when the budget expires go to `onDrop(events, 'close_timeout')`. A
+`close()` resolves with `{ unsent }`, and logs one line when it is above zero. Events
+still queued when the budget expires go to `onDrop(events, 'close_timeout')`. A
 send still running at that moment keeps going in the background, so its result arrives
 after `close()` has returned: it is delivered, or `onDrop` fires for it then
-(`close_timeout` for a retryable failure, `permanent_client_error` for a 4xx).
+(`close_timeout` for a retryable failure, `permanent_client_error` for a final 4xx).
 
 The SDK also registers a `beforeExit` hook that calls `flush()` best-effort. That hook
 does not replace `await close()`.
@@ -411,12 +419,21 @@ const datalyr = new Datalyr({
 | --- | --- |
 | `validation_error` | A missing event name, `userId`, `newUserId`, or `groupId`, or a non-finite purchase `value` |
 | `queue_overflow` | The queue reached `maxQueueSize`. The oldest event was evicted. |
-| `permanent_client_error` | A `4xx` other than `408` or `429` |
-| `max_flush_attempts` | 10 failed flush cycles for one event |
+| `permanent_client_error` | A final `4xx` (any `4xx` except `401`, `403`, `408`, `429`) at once; `401`/`403` after 10 minutes of refusals |
+| `max_flush_attempts` | Temporary failures for longer than `maxRetryDuration` (default 1 hour). The name is kept from earlier versions. |
 | `close_timeout` | `close()` ran out of time |
 | `closed` | `track()` ran after `close()` |
 
 An exception thrown inside your hook is swallowed. A hook can never crash the SDK.
+
+Every drop is also counted, with or without hooks. `getStats()` returns the counts since
+the client was created, by reason, plus how many events are queued and in flight. Drops by
+the queue cap, final answers and expired retries are logged as one summary line per flush
+cycle, never one line per event.
+
+```javascript
+const { dropped, droppedByReason, queued, inFlight } = datalyr.getStats();
+```
 
 ## Delivery, retries, and limits
 
@@ -430,11 +447,14 @@ flight at once.
 | HTTP concurrency | 10 requests in parallel, one event each |
 | Requests per event | One |
 | Retries per send | `retryLimit`, default 3 |
-| Retry backoff | `min(2^n × 1000, 10000)` ms, multiplied by `0.5 + random()/2` |
+| Retry backoff | `min(2^n × 1000, 10000)` ms, multiplied by `0.5 + random()/2`, and never shorter than the server's `Retry-After` |
+| Backoff between failed cycles | `min(2^(n-1) × 1000, 60000)` ms, jittered, and never before `Retry-After` |
+| `Retry-After` | Honoured on any answer, as seconds or an HTTP date, capped at 5 minutes |
 | Request timeout | `timeout`, default 10,000 ms, through `AbortController` |
 | Queue | `maxQueueSize`, default 1000. The oldest event is dropped first. |
-| Failed flush cycles per event | 10, then the event is dropped |
+| Retry window per event | `maxRetryDuration`, default 1 hour (10 minutes for `401`/`403`) |
 | Drain passes per flush | 12 |
+| `flush()` budget | `flushTimeout`, default 30,000 ms |
 | `close()` budget | `closeTimeout`, default 30,000 ms |
 | `eventId` length | 256 characters |
 | Server-side dedupe window | 7 days |
@@ -443,14 +463,16 @@ flight at once.
 
 | Response | Behavior |
 | --- | --- |
-| `2xx` | Success. |
-| `408`, `429`, any `5xx` | Retried with jittered exponential backoff, up to `retryLimit`. |
-| `401`, `403` | Dropped. The SDK logs an authentication failure once. |
-| Other `4xx` | Dropped immediately. Never retried. |
-| Network, DNS, TLS, abort | Retried like a `5xx`. |
+| `2xx` | Success. A duplicate of an `eventId` the server already has is a `200` too. Never sent again. |
+| `408`, `429`, any `5xx` (including `503`) | Kept. Retried with jittered exponential backoff, waiting at least `Retry-After` when the server sends it. |
+| `401`, `403` | Kept and retried for 10 minutes, then dropped. The SDK logs an authentication failure once. |
+| Other `4xx` (`400`, `413`, ...) | Final. Dropped immediately. Never retried. |
+| Network, DNS, TLS, timeout | Kept. Retried like a `5xx`. |
 
-An event that exhausts its retries returns to the front of the queue. After 10 failed
-flush cycles the SDK drops it, so one bad event cannot block the queue.
+Every retry sends the same event, with the same `eventId`, so the server stores it once.
+An event that exhausts its quick retries (`retryLimit`) returns to the front of the queue
+and waits out its backoff. It is dropped only when its failures have lasted longer than
+`maxRetryDuration`, when the queue cap evicts it, or when `close()` runs out of time.
 
 ## Attribution preservation
 

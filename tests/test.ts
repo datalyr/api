@@ -169,7 +169,9 @@ async function main() {
     '9.D.3: pre-close event delivered; post-close event dropped (not sent)');
   assert(drops93.includes('closed'), "9.D.3: post-close track() fires onDrop('closed')");
 
-  // ---- 9.D.8: permanent 401 → sent ONCE, immediate drop, no 10-cycle requeue ----
+  // ---- 9.D.8 / FX-047: 401 → no quick retries, logged once, kept (not dropped at once) ----
+  // FX-047 changed this: a 401 is kept and retried for 10 minutes (tests/retry.ts covers the
+  // window and the final drop), because a key check can fail for a moment.
   let calls401 = 0; const drops401: string[] = [];
   // Count only THIS test's event — an earlier bounded-close test (dl4) may still be running a
   // best-effort background flush against the shared global fetch; filtering keeps the count clean.
@@ -180,10 +182,11 @@ async function main() {
   const dl401 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 3, closeTimeout: 2000, onDrop: (_e, r) => drops401.push(r) });
   await dl401.track({ userId: 'u', event: 'bad_key' });
   await dl401.flush();
-  assert(calls401 === 1, `9.D.8: permanent 401 sent exactly ONCE — no retry, no requeue (got ${calls401}; retry would be 4)`);
-  assert(drops401.includes('permanent_client_error'), "9.D.8: 401 fires onDrop('permanent_client_error')");
+  assert(calls401 === 1, `9.D.8: 401 sent ONCE per flush — no quick retries (got ${calls401}; quick retries would be 4)`);
+  assert(drops401.length === 0, `FX-047: a 401 is kept, not dropped at once (got ${JSON.stringify(drops401)})`);
   await dl401.close();
-  assert(calls401 === 1, `9.D.8: 401 event not re-queued across close() either — still ${calls401} POST`);
+  assert(drops401.length === 1 && drops401[0] === 'close_timeout',
+    `FX-047: close() gives the still-refused event to onDrop('close_timeout') (got ${JSON.stringify(drops401)})`);
 
   // ---- 9.D.8: 429 is TRANSIENT (retried like 5xx), NOT permanent ----
   let calls429 = 0;

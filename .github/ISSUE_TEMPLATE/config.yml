@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://docs.datalyr.com/sdk-reference/node
+    about: Read the Node SDK reference.
+  - name: DATALYR
+    url: https://datalyr.com
+    about: Ask other questions about DATALYR.

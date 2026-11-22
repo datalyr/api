@@ -1,13 +1,13 @@
 import { randomUUID, createHash } from 'node:crypto';
 
-/** Why an event was dropped, passed to the onDrop hook (9.D.7). */
+/** Why an event was dropped, passed to the onDrop hook. */
 export type DropReason =
-  | 'validation_error'   // track/identify/alias/group called with invalid args (9.D.4)
-  | 'queue_overflow'     // maxQueueSize reached; oldest evicted (NODE-5)
-  | 'permanent_client_error' // non-retryable 4xx (≠408/429), e.g. 401/403/400 (9.D.8)
-  | 'max_flush_attempts' // transient failures exceeded MAX_FLUSH_ATTEMPTS cycles (NODE-8)
-  | 'close_timeout'      // still queued when close()'s closeTimeout budget expired (NODE-1)
-  | 'closed';            // track() called after close() (9.D.3)
+  | 'validation_error'   // track/identify/alias/group called with invalid args
+  | 'queue_overflow'     // maxQueueSize reached; oldest evicted
+  | 'permanent_client_error' // non-retryable 4xx (≠408/429), e.g. 401/403/400
+  | 'max_flush_attempts' // transient failures exceeded MAX_FLUSH_ATTEMPTS cycles
+  | 'close_timeout'      // still queued when close()'s closeTimeout budget expired
+  | 'closed';            // track() called after close()
 
 export interface DatalyrConfig {
   apiKey: string;
@@ -22,10 +22,10 @@ export interface DatalyrConfig {
    *  Must be >= worst-case retry time (sendEvent backoff is up to ~7s for 3 retries),
    *  or close() drops events still mid-retry. */
   closeTimeout?: number;
-  /** 9.D.7: called for every send failure (before any retry/requeue/drop decision), so you
+  /** called for every send failure (before any retry/requeue/drop decision), so you
    *  can log/alert on delivery problems. Never throws into the SDK — exceptions are swallowed. */
   onError?: (event: TrackEvent, error: Error) => void;
-  /** 9.D.7: called whenever event(s) are permanently dropped, with the reason. Covers ALL
+  /** called whenever event(s) are permanently dropped, with the reason. Covers ALL
    *  drop paths (overflow, permanent 4xx, max-attempts, post-close, validation). Never
    *  throws into the SDK — exceptions are swallowed. Use this to persist to your own DLQ. */
   onDrop?: (events: TrackEvent[], reason: DropReason) => void;
@@ -57,7 +57,7 @@ export interface TrackOptions {
    *  `event.created`). Defaults to now. Invalid values are ignored (defaults to now) —
    *  pass this on delayed webhook replays so the event lands on the right day. */
   timestamp?: string | Date | number;
-  /** Declared external identity namespaces (Datalyr person contract §6):
+  /** Declared external identity namespaces:
    *  `{ namespace: id }`, e.g. `{ stripe: 'cus_123', crm: 'acct_9' }`. Use this for
    *  ANY identifier that is not the same userId your client-side identify() uses —
    *  internal database ids, provider customer ids, private namespaces. Declared ids
@@ -68,7 +68,7 @@ export interface TrackOptions {
   externalIds?: Record<string, string>;
 }
 
-/** 9.D.6: the revenue payload for trackPurchase(). `value` is required and must be a finite
+/** The revenue payload for trackPurchase(). `value` is required and must be a finite
  *  number (the server reads value ?? revenue ?? amount — value is the canonical field). */
 export interface PurchaseProperties {
   value: number;
@@ -76,7 +76,7 @@ export interface PurchaseProperties {
   [key: string]: any;
 }
 
-// NODE-13: use node:crypto randomUUID unconditionally (GA since Node 14.17). The old
+// use node:crypto randomUUID unconditionally (GA since Node 14.17). The old
 // global-`crypto` guard fell back to a weak Math.random id on Node <19, and eventId is
 // the SERVER dedup key — a collision there is silent data loss.
 function generateEventId(): string {
@@ -84,7 +84,7 @@ function generateEventId(): string {
 }
 
 // A FRESH anonymous id, generated PER CALL — never a shared instance value. This is the
-// fix for NODE-6: a single long-lived server process tracking many distinct end-users
+// a single long-lived server process tracking many distinct end-users
 // must not stamp them all with one anonymous_id (which the ingest identity-resolution
 // then cross-links into one merged identity, leaking traits across users).
 function generateAnonymousId(): string {
@@ -93,14 +93,14 @@ function generateAnonymousId(): string {
 
 const SDK_VERSION = '1.3.4'; // keep in sync with package.json
 
-// NODE-8: max FAILED flush-cycles before an event is dropped (DLQ-lite). Separate from —
+// max FAILED flush-cycles before an event is dropped (DLQ-lite). Separate from —
 // and more generous than — retryLimit (the per-send retry count): a brief outage spans a
 // few flush cycles before recovering, so this must be high enough to survive that, while
 // still preventing a permanently-failing "poison" event from cycling at the queue front
 // forever.
 const MAX_FLUSH_ATTEMPTS = 10;
 
-// B-4: cap the caller-supplied eventId. Longer ids become pathological Redis keys server-side;
+// cap the caller-supplied eventId. Longer ids become pathological Redis keys server-side;
 // overflow is hash-collapsed (deterministic, so redeliveries still dedup) below.
 const MAX_EVENT_ID_LENGTH = 256;
 
@@ -118,17 +118,17 @@ export class Datalyr {
   private timer?: NodeJS.Timeout;
   private isFlushing: boolean = false;
   private isClosing: boolean = false;
-  private closeFinished = false;         // close() has given up; a late transient failure is dropped, not re-queued (DLR-8)
-  private currentFlush?: Promise<void>;  // the in-flight drain — callers/close() await this instead of getting a no-op (NODE-3/TR-25)
-  private closePromise?: Promise<void>;  // memoized so close() is idempotent under repeat/concurrent calls (9.D.3)
-  private warnedNoId = false;            // one-time warn for calls with neither userId nor anonymousId (NODE-6)
-  private warnedQueueFull = false;       // one-time prod warn when the queue overflows (NODE-5)
-  private warnedClosed = false;          // one-time loud error for track() after close() (9.D.3)
-  private warnedAuthFailure = false;     // one-time loud error for 401/403 (9.D.8)
-  private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event (NODE-8); WeakMap → no payload pollution
+  private closeFinished = false;         // close() has given up; a late transient failure is dropped, not re-queued
+  private currentFlush?: Promise<void>;  // the in-flight drain — callers/close() await this instead of getting a no-op
+  private closePromise?: Promise<void>;  // memoized so close() is idempotent under repeat/concurrent calls
+  private warnedNoId = false;            // one-time warn for calls with neither userId nor anonymousId
+  private warnedQueueFull = false;       // one-time prod warn when the queue overflows
+  private warnedClosed = false;          // one-time loud error for track() after close()
+  private warnedAuthFailure = false;     // one-time loud error for 401/403
+  private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event; WeakMap → no payload pollution
   private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
-  private onError?: (event: TrackEvent, error: Error) => void; // 9.D.7
-  private onDrop?: (events: TrackEvent[], reason: DropReason) => void; // 9.D.7
+  private onError?: (event: TrackEvent, error: Error) => void;
+  private onDrop?: (events: TrackEvent[], reason: DropReason) => void;
 
   constructor(config: DatalyrConfig | string) {
     if (typeof config === 'string') {
@@ -170,7 +170,7 @@ export class Datalyr {
     if (this.timeout > 60000) this.timeout = 60000;
     if (this.maxQueueSize < 100) this.maxQueueSize = 100;
     if (this.maxQueueSize > 10000) this.maxQueueSize = 10000;
-    // NODE-12: flushInterval was never validated — 0/negative/NaN makes setInterval
+    // flushInterval was never validated — 0/negative/NaN makes setInterval
     // busy-loop. (The `|| 10000` above only catches 0/undefined, not negatives.)
     if (!(this.flushInterval >= 1000)) this.flushInterval = 10000;
     if (this.flushInterval > 3_600_000) this.flushInterval = 3_600_000;
@@ -180,7 +180,7 @@ export class Datalyr {
     if (!(this.retryLimit >= 0)) this.retryLimit = 3;
     if (this.retryLimit > 10) this.retryLimit = 10;
 
-    // NODE-11: best-effort drain on process exit (short scripts/cron/serverless that
+    // best-effort drain on process exit (short scripts/cron/serverless that
     // finish before flushAt would otherwise lose buffered events — the timer is unref'd
     // and track() doesn't await the network). Does NOT replace `await close()`.
     this.registerExitHook();
@@ -202,7 +202,7 @@ export class Datalyr {
     process.once('beforeExit', this.exitHook);
   }
 
-  // 9.D.7: fan a drop/error out to the caller's observability hook. A hook that throws must
+  // fan a drop/error out to the caller's observability hook. A hook that throws must
   // never crash the SDK (the whole point is defensive delivery), so swallow its exceptions.
   private notifyDrop(events: TrackEvent[], reason: DropReason): void {
     if (!this.onDrop) return;
@@ -243,7 +243,7 @@ export class Datalyr {
       eventProperties = properties || {};
     }
 
-    // 9.D.4: NEVER throw. An invalid event name from deep in caller business logic used to
+    // NEVER throw. An invalid event name from deep in caller business logic used to
     // throw out of this fire-and-forget promise → an ERR_UNHANDLED_REJECTION that crashed
     // the host process (exit 1). Warn, hand it to onDrop, and resolve.
     if (!eventName || typeof eventName !== 'string') {
@@ -252,7 +252,7 @@ export class Datalyr {
       return;
     }
 
-    // 9.D.3: close() is terminal. Post-close track() used to drop silently (debug-only). Emit
+    // close() is terminal. Post-close track() used to drop silently (debug-only). Emit
     // ONE loud, un-gated error so a mis-ordered shutdown (close() before the last track) is
     // visible in prod; every dropped event still reaches onDrop for programmatic handling.
     // For serverless, prefer `await flush()` per invocation and reserve close() for shutdown.
@@ -265,7 +265,7 @@ export class Datalyr {
       return;
     }
 
-    // NODE-6: use the caller-provided anonymousId, else a FRESH one per call — NEVER a
+    // use the caller-provided anonymousId, else a FRESH one per call — NEVER a
     // shared instance value (that merged distinct end-users tracked from one server
     // process into a single identity). A call with neither userId nor anonymousId can't
     // be stitched to a user server-side; warn once so the integrator passes an id.
@@ -284,11 +284,11 @@ export class Datalyr {
     const trackEvent: TrackEvent = {
       userId: userId || undefined,
       anonymousId: anonymousId,  // Always include for identity resolution
-      // Person contract §6: declared namespaces ride the envelope top-level;
+      // declared namespaces ride the envelope top-level;
       // the ingest worker classifies + preserves them for identity joining.
       ...(providedExternalIds && typeof providedExternalIds === 'object'
         ? { externalIds: providedExternalIds } : {}),
-      // 9.D.1: honor a caller-supplied eventId VERBATIM — it is the ingest server's dedup
+      // honor a caller-supplied eventId VERBATIM — it is the ingest server's dedup
       // key (6h window), so webhook handlers can pass the source event id (e.g. Stripe
       // `event.id`) and at-least-once redeliveries no longer double-count revenue. A fresh
       // uuid per call (the old unconditional behavior) made every redelivery look new.
@@ -299,9 +299,9 @@ export class Datalyr {
         library: '@datalyr/api',
         version: SDK_VERSION,
         source: 'api',
-        schema_version: 1 // A3-25: versioned-envelope stamp
+        schema_version: 1 // versioned-envelope stamp
       },
-      // 9.D.5: honor a caller-supplied timestamp (ingest reads `event.timestamp || now`),
+      // honor a caller-supplied timestamp (ingest reads `event.timestamp || now`),
       // so delayed webhook replays land on the day the event happened, not the replay day.
       timestamp: this.resolveTimestamp(providedTimestamp)
     };
@@ -310,20 +310,20 @@ export class Datalyr {
   }
 
   async identify(userId: string, traits?: any, anonymousId?: string): Promise<void> {
-    // 9.D.4: warn-and-drop, never throw (see track()).
+    // warn-and-drop, never throw (see track()).
     if (!userId) {
       console.warn('[Datalyr] identify() requires a userId; call dropped.');
       this.notifyDrop([{ event: '$identify' } as TrackEvent], 'validation_error');
       return;
     }
-    // Route through the options form so a caller-provided anonymousId is honored (NODE-6).
+    // Route through the options form so a caller-provided anonymousId is honored.
     // track() stamps anonymous_id itself — no need to inject the (formerly shared) one.
     // Traits stay flat (not wrapped in $set) so the user-properties-updater extracts them.
     return this.track({ userId, anonymousId, event: '$identify', properties: { ...traits } });
   }
 
   async alias(newUserId: string, previousId?: string, anonymousId?: string): Promise<void> {
-    // 9.D.4: warn-and-drop, never throw.
+    // warn-and-drop, never throw.
     if (!newUserId) {
       console.warn('[Datalyr] alias() requires a newUserId; call dropped.');
       this.notifyDrop([{ event: '$alias' } as TrackEvent], 'validation_error');
@@ -360,7 +360,7 @@ export class Datalyr {
    * B2B account rollups yet.
    */
   async group(userId: string, groupId: string, traits?: any, anonymousId?: string): Promise<void> {
-    // 9.D.4: warn-and-drop, never throw.
+    // warn-and-drop, never throw.
     if (!groupId) {
       console.warn('[Datalyr] group() requires a groupId; call dropped.');
       this.notifyDrop([{ event: '$group', userId } as TrackEvent], 'validation_error');
@@ -370,7 +370,7 @@ export class Datalyr {
   }
 
   /**
-   * 9.D.6: purchase helper with a validated revenue amount. The ingest revenue pipeline
+   * purchase helper with a validated revenue amount. The ingest revenue pipeline
    * reads `value ?? revenue ?? amount` (in that order) — `value` is the canonical field —
    * so this stamps `value` and (defensively) requires it to be a FINITE number. A NaN /
    * Infinity / non-number value would land as $0 or corrupt revenue rollups, so it is
@@ -398,7 +398,7 @@ export class Datalyr {
     });
   }
 
-  // 9.D.1 + B-4: caller-supplied idempotency key. Defensive by design — this SDK must never
+  // caller-supplied idempotency key. Defensive by design — this SDK must never
   // crash the host — so anything that isn't a non-empty string is IGNORED (fresh uuid, same
   // as omitting it) with a debug warning, never a throw. An over-long id (pathological Redis
   // key server-side) is collapsed to a DETERMINISTIC sha256-based value so redeliveries of
@@ -419,7 +419,7 @@ export class Datalyr {
     return generateEventId();
   }
 
-  // 9.D.5: caller-supplied event time, normalized to ISO-8601. Accepts ISO string, Date,
+  // caller-supplied event time, normalized to ISO-8601. Accepts ISO string, Date,
   // or numeric epoch. Numbers < 1e12 are treated as epoch SECONDS (webhook payloads like
   // Stripe's `event.created` are seconds; 1e12 ms is Sep 2001, so real ms timestamps are
   // always above it). Invalid input → now, with a debug warning — never a throw.
@@ -444,7 +444,7 @@ export class Datalyr {
   }
 
   private enqueue(event: TrackEvent): void {
-    // Check queue size limit to prevent memory issues. NODE-5: surface the drop in PROD
+    // Check queue size limit to prevent memory issues. Surface the drop in PROD
     // (once) — it was debug-only, so silent data loss under sustained overload.
     if (this.queue.length >= this.maxQueueSize) {
       if (!this.warnedQueueFull) {
@@ -452,7 +452,7 @@ export class Datalyr {
         console.warn(`[Datalyr] Queue full (${this.maxQueueSize}) — dropping oldest events. Increase maxQueueSize, or flush()/close() more often.`);
       }
       const dropped = this.queue.shift(); // Remove oldest event
-      // 9.D.7: overflow is a drop path — surface it so callers can persist to their own DLQ.
+      // overflow is a drop path — surface it so callers can persist to their own DLQ.
       if (dropped) this.notifyDrop([dropped], 'queue_overflow');
     }
 
@@ -473,11 +473,11 @@ export class Datalyr {
   }
 
   async flush(): Promise<void> {
-    // NODE-3 / TR-25: if a drain is already running, AWAIT it (return the in-flight promise)
+    // if a drain is already running, AWAIT it (return the in-flight promise)
     // rather than no-op'ing. Because the drain LOOPS until the queue empties, awaiting it now
     // also guarantees events enqueued AFTER it started are sent — fixing the serverless
     // `track(); track(); await flush(); return` bug where the second event stranded.
-    // DLR-8: this check must come BEFORE the empty-queue return. _flush() empties the queue
+    // this check must come BEFORE the empty-queue return. _flush() empties the queue
     // as soon as a pass starts, so after an auto-flush (flushAt reached) took the events the
     // queue is empty while their POSTs/retries are still running — returning early there let
     // `await flush()` resolve with sends in flight (serverless freeze → silent loss).
@@ -496,7 +496,7 @@ export class Datalyr {
     }
   }
 
-  // TR-25: a single _flush pass snapshots the queue, so events enqueued during the pass — or
+  // a single _flush pass snapshots the queue, so events enqueued during the pass — or
   // failures it re-queues — would strand on `await flush()`. Loop passes until the queue is
   // empty or a pass DELIVERS NOTHING (every event failed: a down endpoint re-queued/dropped
   // them all). Progress must be measured by successful sends, NOT queue length — a pass that
@@ -522,7 +522,7 @@ export class Datalyr {
       console.log(`[Datalyr] Flushing ${events.length} events`);
     }
 
-    // NODE-7: this is a CONCURRENCY window (10 events in parallel), NOT a single batched
+    // this is a CONCURRENCY window (10 events in parallel), NOT a single batched
     // HTTP request — one POST per event. (Real payload batching is gated on the ingest
     // `/batch` endpoint, currently disabled.)
     const batchSize = 10;
@@ -533,10 +533,10 @@ export class Datalyr {
       const promises = batch.map(event =>
         this.sendEvent(event).catch((err: any) => {
           failed++;
-          // 9.D.7: every send failure reaches onError before any drop/requeue decision.
+          // every send failure reaches onError before any drop/requeue decision.
           this.notifyError(event, err instanceof Error ? err : new Error(String(err)));
 
-          // 9.D.8: a permanent client error (4xx ≠ 408/429 — bad key, malformed, forbidden)
+          // a permanent client error (4xx ≠ 408/429 — bad key, malformed, forbidden)
           // will NEVER succeed on retry, so drop it IMMEDIATELY instead of cycling it 10
           // times. A wrong API key (401/403) black-holes everything, so raise it loudly ONCE
           // as an auth failure — the single most common "no data" support case.
@@ -549,12 +549,12 @@ export class Datalyr {
             return;
           }
 
-          // NODE-8 / NODE-9 / NODE-10: bound re-queue attempts so a permanently-failing
+          // bound re-queue attempts so a permanently-failing
           // (transient) event can't cycle at the front forever (re-failing every flush).
           // Count failed flush-cycles per event (WeakMap, no payload pollution); drop with a
           // VISIBLE warn after MAX_FLUSH_ATTEMPTS cycles. Re-queue at the front so failures
           // retry first.
-          // DLR-8: a send still running when close()'s budget expired is not in the queue,
+          // a send still running when close()'s budget expired is not in the queue,
           // so close() could not report it. If it now fails transiently, re-queueing would
           // strand it on a closed client (no timer, no further drain) — never sent, never
           // reported. Hand it to onDrop as close_timeout instead.
@@ -588,7 +588,7 @@ export class Datalyr {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
-      // NODE-15: clear the abort timer on settle (success OR reject). A fetch rejection
+      // clear the abort timer on settle (success OR reject). A fetch rejection
       // (DNS / ECONNRESET / TLS) used to skip clearTimeout, leaving a non-unref'd timer
       // pending up to `timeout` ms that can delay process exit.
       const response = await fetch(this.host, {
@@ -610,7 +610,7 @@ export class Datalyr {
           // Ignore body read errors
         }
 
-        // 9.D.8: 408 (Request Timeout) and 429 (Too Many Requests) are TRANSIENT — retry
+        // 408 (Request Timeout) and 429 (Too Many Requests) are TRANSIENT — retry
         // them like 5xx. Every other 4xx is a permanent client error: tag it so the flush
         // layer drops it immediately instead of cycling it MAX_FLUSH_ATTEMPTS times.
         if (response.status !== 408 && response.status !== 429 &&
@@ -650,7 +650,7 @@ export class Datalyr {
         if (this.debug) {
           console.log(`[Datalyr] Retrying event (attempt ${retryCount + 1}/${this.retryLimit})`);
         }
-        // NODE-8: full jitter so many SDK instances don't retry in lockstep against a
+        // full jitter so many SDK instances don't retry in lockstep against a
         // recovering server.
         const backoffMs = Math.min(Math.pow(2, retryCount) * 1000, 10000); // Max 10s
         const jittered = backoffMs * (0.5 + Math.random() * 0.5);
@@ -680,7 +680,7 @@ export class Datalyr {
   }
 
   /**
-   * Generate a NEW anonymous id. NODE-6: there is no longer a shared process-wide anon
+   * Generate a NEW anonymous id. There is no longer a shared process-wide anon
    * (that merged distinct users). Each call returns a fresh id — persist it in YOUR
    * per-user/session store and pass it back as `anonymousId` to stitch that user's
    * events. (Behavior change from <=1.2.3, which returned one shared id.)
@@ -689,7 +689,7 @@ export class Datalyr {
     return generateAnonymousId();
   }
 
-  // A cancelable delay: TR-09. Returns the promise AND a cancel() that clears the underlying
+  // A cancelable delay. Returns the promise AND a cancel() that clears the underlying
   // timer, so a Promise.race that settles via the OTHER arm doesn't leave a live (non-unref'd)
   // timer holding the event loop open until it fires — the exact hang the 1.3.0 unref work
   // fixed and the close() race timer had reintroduced.
@@ -701,7 +701,7 @@ export class Datalyr {
 
   // Cleanup
   async close(): Promise<void> {
-    // 9.D.3: idempotent — repeat or concurrent close() calls share ONE drain and never
+    // idempotent — repeat or concurrent close() calls share ONE drain and never
     // restart it (a second close() must not re-run the loop or double-remove the exit hook).
     if (this.closePromise) return this.closePromise;
     this.closePromise = this._close();
@@ -716,7 +716,7 @@ export class Datalyr {
       this.timer = undefined;
     }
 
-    // NODE-1/2/4: actually DRAIN the queue. The old close() flushed ONCE and raced a hard
+    // actually DRAIN the queue. The old close() flushed ONCE and raced a hard
     // 5s timeout — one flush isn't enough (it re-queues failures), a no-op flush won if one
     // was in flight, and 5s < worst-case retry (~7s) dropped mid-retry events. Loop flush()
     // (which now drains until the queue empties instead of no-op'ing) until the queue drains
@@ -729,11 +729,11 @@ export class Datalyr {
     // background (best-effort delivery; it has its own .catch), so close() never blocks past
     // its budget.
     //
-    // TR-09: the budget + pause timers are CANCELED when their race settles (this.delay), so
+    // the budget + pause timers are CANCELED when their race settles (this.delay), so
     // a won race never leaves a live timer pinning the event loop for up to closeTimeout ms
     // after close() resolved (proven: close resolved 14ms, process exited 8016ms).
     //
-    // DLR-8: also loop while a drain is in flight with an EMPTY queue (an auto-flush already
+    // also loop while a drain is in flight with an EMPTY queue (an auto-flush already
     // took the events). flush() returns that drain, so close() waits for its sends — and
     // their onDrop/onError — instead of resolving at ~0ms.
     const start = Date.now();
@@ -772,7 +772,7 @@ export class Datalyr {
     if (this.queue.length > 0) {
       const undelivered = [...this.queue];
       console.warn(`[Datalyr] close(): ${undelivered.length} event(s) undelivered after ~${Date.now() - start}ms (budget ${this.closeTimeout}ms).`);
-      // 9.D.7: hand the survivors to onDrop so callers can persist them (their durability is
+      // hand the survivors to onDrop so callers can persist them (their durability is
       // now the caller's — close() has given up on them).
       this.notifyDrop(undelivered, 'close_timeout');
     }

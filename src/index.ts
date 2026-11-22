@@ -424,7 +424,7 @@ export class Datalyr {
       anonymousId?: string;
       eventId?: string;
       timestamp?: string | Date | number;
-      /** Same as track()'s `externalIds`: `{ namespace: id }`, e.g. `{ stripe: 'cus_123' }`. */
+      /** Same as track()'s `externalIds` (see TrackEvent.externalIds for which namespaces join a user). */
       externalIds?: Record<string, string>;
     }
   ): Promise<void> {

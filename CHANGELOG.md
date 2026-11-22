@@ -14,6 +14,8 @@ All notable changes to this project will be documented in this file.
 - The API key prefix warning accepts `sk_` keys as well as `dk_`.
 - `examples/stripe-webhook.js` sends the Stripe customer id as `externalIds: { stripe }`
   instead of using it as `userId`.
+- `page()` no longer copies the page `name` into `properties.url` when no url is passed.
+  Pass `properties.url` to record the page URL.
 
 ## [1.3.4] - 2026-11-14
 

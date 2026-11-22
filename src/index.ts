@@ -386,11 +386,10 @@ export class Datalyr {
   }
 
   async page(userId: string, name?: string, properties?: any, anonymousId?: string): Promise<void> {
+    // `name` goes in properties.name only. It used to be copied into properties.url when no
+    // url was passed, which recorded a page name (e.g. "Pricing") as the page URL. Pass
+    // `properties.url` for the real URL.
     const props: Record<string, any> = { name, ...properties };
-    // P3: ingest derives page_url ONLY from props.url, so a name-only page() call left
-    // page_url blank server-side. When the caller gives no url, fall back to the page name
-    // so the pageview is at least addressable (callers who want a real URL should pass one).
-    if (props.url == null && name != null) props.url = name;
     return this.track({ userId: userId || undefined, anonymousId, event: '$pageview', properties: props });
   }
 

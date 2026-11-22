@@ -359,6 +359,7 @@ async function main() {
     const dlW = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
     await dlW.page('u_page', 'Pricing', { url: 'https://example.com/pricing', plan: 'pro' }, 'anon_page');
     await dlW.group('u_group', 'org_1', { name: 'Org One', seats: 5 });
+    await dlW.page('u_page2', 'Checkout');
     await dlW.track({ userId: 'u_ext', event: 'ext_on', externalIds: { stripe: 'cus_123', crm: 'acct_9' } });
     await dlW.track({ userId: 'u_ext', event: 'ext_off' });
     await dlW.flush();
@@ -368,6 +369,9 @@ async function main() {
     assert(!!pv && pv.userId === 'u_page' && pv.anonymousId === 'anon_page' && pv.properties.name === 'Pricing' &&
       pv.properties.url === 'https://example.com/pricing' && pv.properties.plan === 'pro',
       'W14: page() sends $pageview with userId, anonymousId, name, the given url and extra properties');
+    const pvNoUrl = sentW.find((e) => e.event === '$pageview' && e.userId === 'u_page2');
+    assert(!!pvNoUrl && pvNoUrl.properties.name === 'Checkout' && !('url' in pvNoUrl.properties),
+      `C7: page() without a url sends name only; name is NOT copied into properties.url (got ${JSON.stringify(pvNoUrl && pvNoUrl.properties)})`);
 
     const grp = w('$group');
     assert(!!grp && grp.userId === 'u_group' && grp.properties.groupId === 'org_1' &&

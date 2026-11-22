@@ -57,14 +57,13 @@ export interface TrackOptions {
    *  `event.created`). Defaults to now. Invalid values are ignored (defaults to now) —
    *  pass this on delayed webhook replays so the event lands on the right day. */
   timestamp?: string | Date | number;
-  /** Declared external identity namespaces:
-   *  `{ namespace: id }`, e.g. `{ stripe: 'cus_123', crm: 'acct_9' }`. Use this for
-   *  ANY identifier that is not the same userId your client-side identify() uses —
-   *  internal database ids, provider customer ids, private namespaces. Declared ids
-   *  join the customer journey the moment the same namespace value is bound to an
-   *  account identifier from any producer. Do NOT put private ids in `userId` or
-   *  `anonymousId` — they cannot join there and the workspace health surface will
-   *  flag them as an unjoined namespace. */
+  /** Identifiers from other systems: `{ namespace: id }`, e.g. `{ firebase: 'uid_42' }`.
+   *  Never put another system's id in `userId` or `anonymousId`.
+   *  From this SDK, `firebase` joins a user when the same value is bound to that user,
+   *  and `klaviyo` joins after DATALYR's Klaviyo checks. Provider namespaces (`stripe`,
+   *  `shopify`, `whop`, `revenuecat`, `superwall` and the other connected sources) and
+   *  any other namespace are stored on the event but join no one: only the provider's
+   *  own connection in DATALYR links its ids. */
   externalIds?: Record<string, string>;
 }
 
@@ -415,7 +414,7 @@ export class Datalyr {
    * so this stamps `value` and (defensively) requires it to be a FINITE number. A NaN /
    * Infinity / non-number value would land as $0 or corrupt revenue rollups, so it is
    * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency),
-   * timestamp (backdating) and externalIds (declared namespaces, e.g. `{ stripe: 'cus_123' }`)
+   * timestamp (backdating) and externalIds (see TrackEvent.externalIds)
    * exactly like track(); externalIds is sent only when passed.
    */
   async trackPurchase(

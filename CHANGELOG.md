@@ -12,8 +12,8 @@ All notable changes to this project will be documented in this file.
   `MaxListenersExceededWarning` when a client was created per request). Each live client is
   still flushed once on exit; the listener is removed when the last client is closed.
 - The API key prefix warning accepts `sk_` keys as well as `dk_`.
-- `examples/stripe-webhook.js` sends the Stripe customer id as `externalIds: { stripe }`
-  instead of using it as `userId`.
+- `examples/stripe-webhook.js` no longer uses the Stripe customer id as `userId`. DATALYR
+  links Stripe customers only through its own Stripe connection.
 - `page()` no longer copies the page `name` into `properties.url` when no url is passed.
   Pass `properties.url` to record the page URL.
 

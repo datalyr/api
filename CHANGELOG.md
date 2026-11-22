@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Warnings for dropped events (invalid `track()`/`identify()`/`alias()`/`group()`/`trackPurchase()`
+  arguments, and events dropped after the maximum failed flush attempts) are logged once per
+  client for each kind, then only with `debug: true`. `onDrop` and `onError` still fire for every event.
+
 ## [1.3.4] - 2026-11-14
 
 ### Fixed

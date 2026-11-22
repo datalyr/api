@@ -302,6 +302,49 @@ async function main() {
   assert(drops8c.length === 1 && drops8c[0] === 'close_timeout',
     `DLR-8: a late transient failure after close() fires onDrop('close_timeout') instead of stranding (got ${JSON.stringify(drops8c)})`);
 
+  // ---- W3: per-event warnings log once per instance (then only with debug); hooks still fire ----
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: any[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      let n3 = 0;
+      (globalThis as any).fetch = async (_u: string, opts: any) => {
+        if (JSON.parse(opts.body).event.startsWith('w3_')) n3++;
+        return { ok: false, status: 503, statusText: 'down', text: async () => '' };
+      };
+      const drops3: string[] = [];
+      const dl3w = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0, closeTimeout: 1000, onDrop: (_e, r) => drops3.push(r) });
+      await dl3w.track({ userId: 'u', event: 'w3_a' });
+      await dl3w.track({ userId: 'u', event: 'w3_b' });
+      for (let i = 0; i < 10; i++) await dl3w.flush(); // each flush = one failed cycle per event
+      const maxWarns = warns.filter((w) => w.includes('failed flush attempts')).length;
+      assert(drops3.filter((r) => r === 'max_flush_attempts').length === 2,
+        `W3: both events still reach onDrop('max_flush_attempts') (got ${drops3.filter((r) => r === 'max_flush_attempts').length})`);
+      assert(maxWarns === 1, `W3: max-attempts drop warned ONCE per instance, not per event (got ${maxWarns})`);
+
+      warns.length = 0;
+      await dl3w.identify('' as any); await dl3w.identify('' as any); await dl3w.identify('' as any);
+      await dl3w.alias('' as any); await dl3w.alias('' as any);
+      await dl3w.group('u', '' as any); await dl3w.group('u', '' as any);
+      await dl3w.track({ event: '' } as any); await dl3w.track(null, '');
+      await dl3w.trackPurchase('u', { value: NaN }); await dl3w.trackPurchase('u', { value: NaN });
+      assert(warns.length === 5, `W3: 11 invalid calls of 5 kinds log 5 warnings, one per kind (got ${warns.length})`);
+      assert(drops3.filter((r) => r === 'validation_error').length === 11,
+        `W3: every invalid call still reaches onDrop('validation_error') (got ${drops3.filter((r) => r === 'validation_error').length})`);
+      await dl3w.close();
+
+      warns.length = 0;
+      const dl3d = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, debug: true });
+      await dl3d.identify('' as any); await dl3d.identify('' as any);
+      assert(warns.filter((w) => w.includes('identify() requires')).length === 2,
+        'W3: with debug: true every occurrence is still logged');
+      await dl3d.close();
+    } finally {
+      console.warn = origWarn;
+    }
+  }
+
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);
 }

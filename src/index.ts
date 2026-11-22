@@ -125,6 +125,7 @@ export class Datalyr {
   private warnedQueueFull = false;       // one-time prod warn when the queue overflows
   private warnedClosed = false;          // one-time loud error for track() after close()
   private warnedAuthFailure = false;     // one-time loud error for 401/403
+  private warnedKinds = new Set<string>(); // warnings already logged once on this instance (see warnOnce)
   private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event; WeakMap → no payload pollution
   private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
   private onError?: (event: TrackEvent, error: Error) => void;
@@ -209,6 +210,19 @@ export class Datalyr {
     try { this.onDrop(events, reason); } catch { /* a hook must never break the SDK */ }
   }
 
+  // Log a warning the first time each kind happens on this instance; repeats are logged
+  // only with `debug: true`. Per-event warnings used to print on EVERY dropped event and
+  // ignore `debug`, flooding logs under a bad integration or an outage. onDrop/onError
+  // still fire for every event, so nothing is lost to callers who need the full count.
+  private warnOnce(kind: string, message: string): void {
+    if (this.warnedKinds.has(kind)) {
+      if (this.debug) console.warn(message);
+      return;
+    }
+    this.warnedKinds.add(kind);
+    console.warn(message + ' (Logged once; set debug: true to log every occurrence.)');
+  }
+
   private notifyError(event: TrackEvent, error: Error): void {
     if (!this.onError) return;
     try { this.onError(event, error); } catch { /* a hook must never break the SDK */ }
@@ -247,7 +261,7 @@ export class Datalyr {
     // throw out of this fire-and-forget promise → an ERR_UNHANDLED_REJECTION that crashed
     // the host process (exit 1). Warn, hand it to onDrop, and resolve.
     if (!eventName || typeof eventName !== 'string') {
-      console.warn('[Datalyr] track() requires a non-empty string event name; event dropped.');
+      this.warnOnce('track_event_name', '[Datalyr] track() requires a non-empty string event name; event dropped.');
       this.notifyDrop([{ event: String(eventName ?? ''), userId } as TrackEvent], 'validation_error');
       return;
     }
@@ -312,7 +326,7 @@ export class Datalyr {
   async identify(userId: string, traits?: any, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw (see track()).
     if (!userId) {
-      console.warn('[Datalyr] identify() requires a userId; call dropped.');
+      this.warnOnce('identify_user_id', '[Datalyr] identify() requires a userId; call dropped.');
       this.notifyDrop([{ event: '$identify' } as TrackEvent], 'validation_error');
       return;
     }
@@ -325,7 +339,7 @@ export class Datalyr {
   async alias(newUserId: string, previousId?: string, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw.
     if (!newUserId) {
-      console.warn('[Datalyr] alias() requires a newUserId; call dropped.');
+      this.warnOnce('alias_user_id', '[Datalyr] alias() requires a newUserId; call dropped.');
       this.notifyDrop([{ event: '$alias' } as TrackEvent], 'validation_error');
       return;
     }
@@ -362,7 +376,7 @@ export class Datalyr {
   async group(userId: string, groupId: string, traits?: any, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw.
     if (!groupId) {
-      console.warn('[Datalyr] group() requires a groupId; call dropped.');
+      this.warnOnce('group_id', '[Datalyr] group() requires a groupId; call dropped.');
       this.notifyDrop([{ event: '$group', userId } as TrackEvent], 'validation_error');
       return;
     }
@@ -384,7 +398,7 @@ export class Datalyr {
   ): Promise<void> {
     const value = purchase?.value;
     if (typeof value !== 'number' || !Number.isFinite(value)) {
-      console.warn('[Datalyr] trackPurchase() requires a finite numeric `value` (revenue amount); event dropped.');
+      this.warnOnce('purchase_value', '[Datalyr] trackPurchase() requires a finite numeric `value` (revenue amount); event dropped.');
       this.notifyDrop([{ event: 'purchase', userId: userId || undefined } as TrackEvent], 'validation_error');
       return;
     }
@@ -566,7 +580,7 @@ export class Datalyr {
           const n = (this.flushAttempts.get(event) || 0) + 1;
           this.flushAttempts.set(event, n);
           if (n >= MAX_FLUSH_ATTEMPTS) {
-            console.warn(`[Datalyr] Dropping event after ${n} failed flush attempts: ${event.event}`);
+            this.warnOnce('max_flush_attempts', `[Datalyr] Dropping event after ${n} failed flush attempts: ${event.event}`);
             this.notifyDrop([event], 'max_flush_attempts');
           } else {
             this.queue.unshift(event);

@@ -300,6 +300,12 @@ async function main() {
   const purch = sentTP.filter((e) => e.event === 'purchase');
   assert(purch.length === 1 && purch[0].properties.value === 49.99 && purch[0].properties.currency === 'USD' && purch[0].eventId === 'order_1',
     '9.D.6: trackPurchase sends value+uppercased currency+eventId for a valid finite value');
+  await dlTP.trackPurchase('u', { value: 10 }, { eventId: 'order_ext', externalIds: { stripe: 'cus_42' } });
+  await dlTP.flush();
+  const purchExt = sentTP.find((e) => e.eventId === 'order_ext');
+  assert(!!purchExt && JSON.stringify(purchExt.externalIds) === JSON.stringify({ stripe: 'cus_42' }),
+    `C8: trackPurchase() sends opts.externalIds on the envelope like track() (got ${JSON.stringify(purchExt && purchExt.externalIds)})`);
+  assert(!('externalIds' in purch[0]), 'C8: trackPurchase() without externalIds sends no externalIds key');
   assert(dropsTP.filter((r) => r === 'validation_error').length === 3,
     `9.D.6: NaN/non-number/missing value each dropped (got ${dropsTP.filter((r) => r === 'validation_error').length})`);
   await dlTP.close();

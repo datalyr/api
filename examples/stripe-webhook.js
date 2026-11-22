@@ -48,7 +48,7 @@ app.post('/webhooks/stripe',
         // dropped rather than counted as $0. eventId makes redeliveries idempotent (no
         // double-counted revenue); timestamp backdates delayed replays.
         await datalyr.trackPurchase(
-          session.client_reference_id || session.customer,
+          session.client_reference_id || null,
           {
             value: session.amount_total / 100,
             currency: session.currency,
@@ -56,7 +56,12 @@ app.post('/webhooks/stripe',
             stripeSessionId: session.id,
             customerEmail: session.customer_details?.email
           },
-          { eventId: event.id, timestamp: event.created }
+          {
+            eventId: event.id,
+            timestamp: event.created,
+            // guest checkouts have no Stripe customer
+            externalIds: session.customer ? { stripe: session.customer } : undefined
+          }
         );
         break;
 

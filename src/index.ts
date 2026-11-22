@@ -414,13 +414,20 @@ export class Datalyr {
    * reads `value ?? revenue ?? amount` (in that order) — `value` is the canonical field —
    * so this stamps `value` and (defensively) requires it to be a FINITE number. A NaN /
    * Infinity / non-number value would land as $0 or corrupt revenue rollups, so it is
-   * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency) and
-   * timestamp (backdating) exactly like track().
+   * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency),
+   * timestamp (backdating) and externalIds (declared namespaces, e.g. `{ stripe: 'cus_123' }`)
+   * exactly like track(); externalIds is sent only when passed.
    */
   async trackPurchase(
     userId: string | null,
     purchase: PurchaseProperties,
-    opts?: { anonymousId?: string; eventId?: string; timestamp?: string | Date | number }
+    opts?: {
+      anonymousId?: string;
+      eventId?: string;
+      timestamp?: string | Date | number;
+      /** Same as track()'s `externalIds`: `{ namespace: id }`, e.g. `{ stripe: 'cus_123' }`. */
+      externalIds?: Record<string, string>;
+    }
   ): Promise<void> {
     const value = purchase?.value;
     if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -434,6 +441,7 @@ export class Datalyr {
       event: 'purchase',
       eventId: opts?.eventId,
       timestamp: opts?.timestamp,
+      externalIds: opts?.externalIds,
       properties: { ...purchase, value, currency: (purchase.currency || 'USD').toUpperCase() }
     });
   }

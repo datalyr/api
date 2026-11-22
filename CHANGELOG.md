@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
 - `page()` no longer copies the page `name` into `properties.url` when no url is passed.
   Pass `properties.url` to record the page URL.
 
+### Added
+- `trackPurchase()` options accept `externalIds` (same as `track()`), sent only when passed.
+
 ## [1.3.4] - 2026-11-14
 
 ### Fixed

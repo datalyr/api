@@ -16,6 +16,50 @@ function mockFetch(into: any[]) {
 }
 
 async function main() {
+  // ---- W12a: ONE shared beforeExit listener, not one per instance; removed on close() ----
+  // Runs first, before any other test creates a client, so the counts start clean.
+  {
+    const before = process.listenerCount('beforeExit');
+    const clients = Array.from({ length: 20 }, () => new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 }));
+    const during = process.listenerCount('beforeExit');
+    assert(during - before <= 1, `W12a: 20 clients add at most ONE beforeExit listener (added ${during - before})`);
+    for (const c of clients) await c.close();
+    assert(process.listenerCount('beforeExit') === before,
+      `W12a: the listener is removed once the last client closes (have ${process.listenerCount('beforeExit')}, started with ${before})`);
+
+    // the shared listener still flushes every live client's queue on beforeExit
+    const sentX: any[] = [];
+    mockFetch(sentX);
+    const x1 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    const x2 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    await x1.track({ userId: 'u', event: 'exit_1' });
+    await x2.track({ userId: 'u', event: 'exit_2' });
+    process.emit('beforeExit', 0);
+    await new Promise((r) => setTimeout(r, 50));
+    assert(sentX.some((e) => e.event === 'exit_1') && sentX.some((e) => e.event === 'exit_2'),
+      'W12a: beforeExit flushes the queue of every live client');
+    assert(process.listenerCount('beforeExit') === before,
+      'W12a: after the exit flush the shared listener is gone (each client flushes once, like process.once)');
+    await x1.close(); await x2.close();
+  }
+
+  // ---- W12b: the key-prefix warning accepts sk_ (server key) as well as dk_ ----
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: any[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      const k1 = new Datalyr({ apiKey: 'sk_test', flushAt: 100, flushInterval: 3_600_000 });
+      const k2 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+      assert(!warns.some((w) => w.includes('should start with')), 'W12b: sk_ and dk_ keys do not trigger the key-prefix warning');
+      const k3 = new Datalyr({ apiKey: 'xx_test', flushAt: 100, flushInterval: 3_600_000 });
+      assert(warns.some((w) => w.includes('should start with')), 'W12b: any other prefix still warns');
+      await k1.close(); await k2.close(); await k3.close();
+    } finally {
+      console.warn = origWarn;
+    }
+  }
+
   // ---- NODE-6: distinct users get DISTINCT anonymous ids (no shared/merged identity) ----
   const sent: any[] = [];
   mockFetch(sent);

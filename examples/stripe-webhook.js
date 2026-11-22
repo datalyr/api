@@ -6,6 +6,10 @@
 // redelivered purchase is counted once instead of double-counting revenue.
 // Also pass `timestamp: event.created` (epoch seconds) so delayed replays land on the
 // day the event actually happened, not the day the retry arrived.
+//
+// IDENTITY: `userId` is YOUR app's user id (the one your client-side identify() uses).
+// Never put the Stripe customer id there. Send it as `externalIds: { stripe: <customer id> }`;
+// DATALYR joins it to the customer journey once that Stripe customer is linked to a user.
 const express = require('express');
 const { Datalyr } = require('@datalyr/api');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -61,7 +65,8 @@ app.post('/webhooks/stripe',
 
         // Track subscription start
         await datalyr.track({
-          userId: subscription.metadata?.userId || subscription.customer,
+          userId: subscription.metadata?.userId,
+          externalIds: { stripe: subscription.customer },
           event: 'subscription_started',
           eventId: event.id,
           timestamp: event.created,
@@ -74,15 +79,17 @@ app.post('/webhooks/stripe',
           }
         });
 
-        // Update user traits
-        await datalyr.identify(
-          subscription.metadata?.userId || subscription.customer,
-          {
-            subscriptionStatus: 'active',
-            subscriptionPlan: subscription.items.data[0].price.nickname,
-            stripeCustomerId: subscription.customer
-          }
-        );
+        // Update user traits (only when you know your own user id)
+        if (subscription.metadata?.userId) {
+          await datalyr.identify(
+            subscription.metadata.userId,
+            {
+              subscriptionStatus: 'active',
+              subscriptionPlan: subscription.items.data[0].price.nickname,
+              stripeCustomerId: subscription.customer
+            }
+          );
+        }
         break;
 
       case 'customer.subscription.deleted':
@@ -90,7 +97,8 @@ app.post('/webhooks/stripe',
 
         // Track cancellation
         await datalyr.track({
-          userId: canceledSub.metadata?.userId || canceledSub.customer,
+          userId: canceledSub.metadata?.userId,
+          externalIds: { stripe: canceledSub.customer },
           event: 'subscription_canceled',
           eventId: event.id,
           timestamp: event.created,
@@ -101,14 +109,16 @@ app.post('/webhooks/stripe',
           }
         });
 
-        // Update user traits
-        await datalyr.identify(
-          canceledSub.metadata?.userId || canceledSub.customer,
-          {
-            subscriptionStatus: 'canceled',
-            subscriptionEndDate: new Date(canceledSub.ended_at * 1000).toISOString()
-          }
-        );
+        // Update user traits (only when you know your own user id)
+        if (canceledSub.metadata?.userId) {
+          await datalyr.identify(
+            canceledSub.metadata.userId,
+            {
+              subscriptionStatus: 'canceled',
+              subscriptionEndDate: new Date(canceledSub.ended_at * 1000).toISOString()
+            }
+          );
+        }
         break;
 
       case 'invoice.payment_failed':
@@ -116,7 +126,8 @@ app.post('/webhooks/stripe',
 
         // Track failed payment
         await datalyr.track({
-          userId: invoice.metadata?.userId || invoice.customer,
+          userId: invoice.metadata?.userId,
+          externalIds: { stripe: invoice.customer },
           event: 'payment_failed',
           eventId: event.id,
           timestamp: event.created,

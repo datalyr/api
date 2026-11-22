@@ -127,7 +127,13 @@ export class Datalyr {
   private warnedAuthFailure = false;     // one-time loud error for 401/403
   private warnedKinds = new Set<string>(); // warnings already logged once on this instance (see warnOnce)
   private flushAttempts = new WeakMap<TrackEvent, number>(); // failed-flush-cycle count per event; WeakMap → no payload pollution
-  private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
+  private exitFlushed = false;           // the process-exit flush already ran for this client (once, like the old process.once)
+  // ONE process-level beforeExit listener shared by every live client. One listener per
+  // instance made apps that build a client per request hit MaxListenersExceededWarning and
+  // pinned every instance. A plain Set is enough: an unclosed client is already held by its
+  // flush timer, and close() removes it here (and the listener when the last client closes).
+  private static liveClients = new Set<Datalyr>();
+  private static exitListener?: () => void;
   private onError?: (event: TrackEvent, error: Error) => void;
   private onDrop?: (events: TrackEvent[], reason: DropReason) => void;
 
@@ -160,8 +166,8 @@ export class Datalyr {
       throw new Error('Datalyr API key is required');
     }
 
-    if (!this.apiKey.startsWith('dk_')) {
-      console.warn('[Datalyr] API key should start with "dk_"');
+    if (!this.apiKey.startsWith('dk_') && !this.apiKey.startsWith('sk_')) {
+      console.warn('[Datalyr] API key should start with "dk_" or "sk_"');
     }
 
     // Validate config values
@@ -191,16 +197,37 @@ export class Datalyr {
   }
 
   private registerExitHook(): void {
-    if (typeof process === 'undefined' || typeof process.once !== 'function') return;
-    // Stored on the instance so close() can removeListener it (review M2: `once` without
-    // removal leaks the instance + its queue for the process lifetime when close() is
-    // called and the hook never fires — bad for per-request client construction).
-    this.exitHook = () => {
-      if (this.isClosing || this.queue.length === 0) return;
-      // beforeExit lets the loop run async work; best-effort (use close() for guarantees).
-      this.flush().catch(() => {});
-    };
-    process.once('beforeExit', this.exitHook);
+    if (typeof process === 'undefined' || typeof process.on !== 'function') return;
+    Datalyr.liveClients.add(this);
+    if (!Datalyr.exitListener) {
+      Datalyr.exitListener = () => Datalyr.flushAllOnExit();
+      process.on('beforeExit', Datalyr.exitListener);
+    }
+  }
+
+  // beforeExit lets the loop run async work; best-effort (use close() for guarantees). Each
+  // client is flushed at most once here, as with the old per-instance process.once, so a
+  // down endpoint cannot keep re-triggering beforeExit and hold the process open.
+  private static flushAllOnExit(): void {
+    for (const client of [...Datalyr.liveClients]) {
+      if (client.exitFlushed) continue;
+      client.exitFlushed = true;
+      Datalyr.liveClients.delete(client);
+      if (client.isClosing || client.queue.length === 0) continue;
+      client.flush().catch(() => {});
+    }
+    if (Datalyr.liveClients.size === 0) Datalyr.removeExitListener();
+  }
+
+  private unregisterExitHook(): void {
+    Datalyr.liveClients.delete(this);
+    if (Datalyr.liveClients.size === 0) Datalyr.removeExitListener();
+  }
+
+  private static removeExitListener(): void {
+    if (!Datalyr.exitListener) return;
+    try { process.removeListener('beforeExit', Datalyr.exitListener); } catch { /* noop */ }
+    Datalyr.exitListener = undefined;
   }
 
   // fan a drop/error out to the caller's observability hook. A hook that throws must
@@ -777,11 +804,9 @@ export class Datalyr {
 
     this.closeFinished = true;
 
-    // review M2: stop leaking the beforeExit listener (+ the instance/queue it pins).
-    if (this.exitHook) {
-      try { process.removeListener('beforeExit', this.exitHook); } catch { /* noop */ }
-      this.exitHook = undefined;
-    }
+    // review M2: stop pinning this client (+ its queue) from the shared beforeExit
+    // listener; the listener itself goes when the last live client closes.
+    this.unregisterExitHook();
 
     if (this.queue.length > 0) {
       const undelivered = [...this.queue];

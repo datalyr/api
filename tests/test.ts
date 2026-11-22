@@ -1,5 +1,6 @@
 // Functional tests for the Node SDK. Mocks global fetch (no real network) and asserts
 // the 1.2.4 fixes. Run with: node tests/test.ts  (Node 23+ strips types).
+import { readFileSync } from 'node:fs';
 import { Datalyr } from '../src/index.ts';
 
 let failures = 0;
@@ -16,6 +17,50 @@ function mockFetch(into: any[]) {
 }
 
 async function main() {
+  // ---- W12a: ONE shared beforeExit listener, not one per instance; removed on close() ----
+  // Runs first, before any other test creates a client, so the counts start clean.
+  {
+    const before = process.listenerCount('beforeExit');
+    const clients = Array.from({ length: 20 }, () => new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 }));
+    const during = process.listenerCount('beforeExit');
+    assert(during - before <= 1, `W12a: 20 clients add at most ONE beforeExit listener (added ${during - before})`);
+    for (const c of clients) await c.close();
+    assert(process.listenerCount('beforeExit') === before,
+      `W12a: the listener is removed once the last client closes (have ${process.listenerCount('beforeExit')}, started with ${before})`);
+
+    // the shared listener still flushes every live client's queue on beforeExit
+    const sentX: any[] = [];
+    mockFetch(sentX);
+    const x1 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    const x2 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    await x1.track({ userId: 'u', event: 'exit_1' });
+    await x2.track({ userId: 'u', event: 'exit_2' });
+    process.emit('beforeExit', 0);
+    await new Promise((r) => setTimeout(r, 50));
+    assert(sentX.some((e) => e.event === 'exit_1') && sentX.some((e) => e.event === 'exit_2'),
+      'W12a: beforeExit flushes the queue of every live client');
+    assert(process.listenerCount('beforeExit') === before,
+      'W12a: after the exit flush the shared listener is gone (each client flushes once, like process.once)');
+    await x1.close(); await x2.close();
+  }
+
+  // ---- W12b: the key-prefix warning accepts sk_ (server key) as well as dk_ ----
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: any[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      const k1 = new Datalyr({ apiKey: 'sk_test', flushAt: 100, flushInterval: 3_600_000 });
+      const k2 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+      assert(!warns.some((w) => w.includes('should start with')), 'W12b: sk_ and dk_ keys do not trigger the key-prefix warning');
+      const k3 = new Datalyr({ apiKey: 'xx_test', flushAt: 100, flushInterval: 3_600_000 });
+      assert(warns.some((w) => w.includes('should start with')), 'W12b: any other prefix still warns');
+      await k1.close(); await k2.close(); await k3.close();
+    } finally {
+      console.warn = origWarn;
+    }
+  }
+
   // ---- NODE-6: distinct users get DISTINCT anonymous ids (no shared/merged identity) ----
   const sent: any[] = [];
   mockFetch(sent);
@@ -255,6 +300,12 @@ async function main() {
   const purch = sentTP.filter((e) => e.event === 'purchase');
   assert(purch.length === 1 && purch[0].properties.value === 49.99 && purch[0].properties.currency === 'USD' && purch[0].eventId === 'order_1',
     '9.D.6: trackPurchase sends value+uppercased currency+eventId for a valid finite value');
+  await dlTP.trackPurchase('u', { value: 10 }, { eventId: 'order_ext', externalIds: { stripe: 'cus_42' } });
+  await dlTP.flush();
+  const purchExt = sentTP.find((e) => e.eventId === 'order_ext');
+  assert(!!purchExt && JSON.stringify(purchExt.externalIds) === JSON.stringify({ stripe: 'cus_42' }),
+    `C8: trackPurchase() sends opts.externalIds on the envelope like track() (got ${JSON.stringify(purchExt && purchExt.externalIds)})`);
+  assert(!('externalIds' in purch[0]), 'C8: trackPurchase() without externalIds sends no externalIds key');
   assert(dropsTP.filter((r) => r === 'validation_error').length === 3,
     `9.D.6: NaN/non-number/missing value each dropped (got ${dropsTP.filter((r) => r === 'validation_error').length})`);
   await dlTP.close();
@@ -301,6 +352,134 @@ async function main() {
   await new Promise((r) => setTimeout(r, 1000)); // let the late 503 land
   assert(drops8c.length === 1 && drops8c[0] === 'close_timeout',
     `DLR-8: a late transient failure after close() fires onDrop('close_timeout') instead of stranding (got ${JSON.stringify(drops8c)})`);
+
+  // ---- W14: page(), group(), externalIds, context shape, SDK version ----
+  {
+    const sentW: any[] = [];
+    const headersW: any[] = [];
+    (globalThis as any).fetch = async (_url: string, opts: any) => {
+      sentW.push(JSON.parse(opts.body));
+      headersW.push(opts.headers);
+      return { ok: true, status: 200, statusText: 'OK', text: async () => '', json: async () => ({}) };
+    };
+    const dlW = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    await dlW.page('u_page', 'Pricing', { url: 'https://example.com/pricing', plan: 'pro' }, 'anon_page');
+    await dlW.group('u_group', 'org_1', { name: 'Org One', seats: 5 });
+    await dlW.page('u_page2', 'Checkout');
+    await dlW.track({ userId: 'u_ext', event: 'ext_on', externalIds: { stripe: 'cus_123', crm: 'acct_9' } });
+    await dlW.track({ userId: 'u_ext', event: 'ext_off' });
+    await dlW.flush();
+    const w = (n: string) => sentW.find((e) => e.event === n);
+
+    const pv = w('$pageview');
+    assert(!!pv && pv.userId === 'u_page' && pv.anonymousId === 'anon_page' && pv.properties.name === 'Pricing' &&
+      pv.properties.url === 'https://example.com/pricing' && pv.properties.plan === 'pro',
+      'W14: page() sends $pageview with userId, anonymousId, name, the given url and extra properties');
+    const pvNoUrl = sentW.find((e) => e.event === '$pageview' && e.userId === 'u_page2');
+    assert(!!pvNoUrl && pvNoUrl.properties.name === 'Checkout' && !('url' in pvNoUrl.properties),
+      `C7: page() without a url sends name only; name is NOT copied into properties.url (got ${JSON.stringify(pvNoUrl && pvNoUrl.properties)})`);
+
+    const grp = w('$group');
+    assert(!!grp && grp.userId === 'u_group' && grp.properties.groupId === 'org_1' &&
+      grp.properties.name === 'Org One' && grp.properties.seats === 5,
+      'W14: group() sends $group with userId, groupId and the traits');
+
+    assert(JSON.stringify(w('ext_on').externalIds) === JSON.stringify({ stripe: 'cus_123', crm: 'acct_9' }),
+      'W14: track() externalIds ride the envelope top-level, unchanged');
+    assert(!('externalIds' in w('ext_off')), 'W14: no externalIds key when none passed');
+
+    const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+    assert(JSON.stringify(w('ext_off').context) === JSON.stringify({ library: '@datalyr/api', version: pkgVersion, source: 'api', schema_version: 1 }),
+      `W14: context is exactly { library, version, source: 'api', schema_version: 1 } (got ${JSON.stringify(w('ext_off').context)})`);
+    assert(w('ext_off').context.version === pkgVersion,
+      `W14: SDK_VERSION (${w('ext_off').context.version}) equals package.json version (${pkgVersion})`);
+    assert(headersW[0]['User-Agent'] === `@datalyr/api/${pkgVersion}`, 'W14: User-Agent carries the package.json version');
+    await dlW.close();
+  }
+
+  // ---- W14: a fetch that throws is transient (onError, re-queued, sent on the next flush) ----
+  {
+    let failNet = true;
+    const sentN: any[] = [];
+    (globalThis as any).fetch = async (_url: string, opts: any) => {
+      const body = JSON.parse(opts.body);
+      if (body.event !== 'net_fail') return { ok: true, status: 200, statusText: 'OK', text: async () => '' };
+      if (failNet) throw new TypeError('fetch failed');
+      sentN.push(body);
+      return { ok: true, status: 200, statusText: 'OK', text: async () => '', json: async () => ({}) };
+    };
+    const errsN: Error[] = []; const dropsN: string[] = [];
+    const dlN = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0,
+      onError: (_e, err) => errsN.push(err), onDrop: (_e, r) => dropsN.push(r) });
+    await dlN.track({ userId: 'u', event: 'net_fail' });
+    await dlN.flush();
+    assert(errsN.length === 1 && errsN[0].message === 'fetch failed', `W14: a throwing fetch reaches onError with its error (got ${errsN.map((e) => e.message)})`);
+    assert(dropsN.length === 0 && sentN.length === 0, 'W14: a throwing fetch does not drop the event');
+    failNet = false;
+    await new Promise((r) => setTimeout(r, 1100)); // FX-047: a failed event waits out its backoff (first one at most 1 s)
+    await dlN.flush();
+    assert(sentN.length === 1, 'W14: the event is re-queued and sent once the network recovers');
+    await dlN.close();
+  }
+
+  // ---- W14: a fetch that never answers is aborted after `timeout` ms ----
+  {
+    (globalThis as any).fetch = (_url: string, opts: any) => new Promise((_res, rej) => {
+      opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    });
+    const errsT: Error[] = [];
+    const dlT = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0, timeout: 1000, closeTimeout: 1000,
+      onError: (_e, err) => errsT.push(err) });
+    await dlT.track({ userId: 'u', event: 'hangs' });
+    const tT = Date.now();
+    await dlT.flush();
+    const elT = Date.now() - tT;
+    assert(errsT.length === 1 && errsT[0].name === 'AbortError', `W14: a hung request is aborted and reaches onError (got ${errsT.map((e) => e.name)})`);
+    assert(elT >= 900 && elT < 3000, `W14: the abort fires at the configured timeout (~1000ms, took ${elT}ms)`);
+    await dlT.close();
+  }
+
+  // ---- W3: per-event warnings log once per instance (then only with debug); hooks still fire ----
+  // Send-side drops (here a final 400) are reported by FX-047's summary: ONE line per flush
+  // cycle, never one per event. Validation drops use warnOnce: one line per kind.
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: any[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      (globalThis as any).fetch = async () => ({ ok: false, status: 400, statusText: 'bad request', text: async () => '' });
+      const drops3: string[] = [];
+      const dl3w = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0, closeTimeout: 1000, onDrop: (_e, r) => drops3.push(r) });
+      await dl3w.track({ userId: 'u', event: 'w3_a' });
+      await dl3w.track({ userId: 'u', event: 'w3_b' });
+      await dl3w.flush();
+      const dropLines = warns.filter((w) => w.includes('dropped since the last report'));
+      assert(drops3.filter((r) => r === 'permanent_client_error').length === 2,
+        `W3: both events still reach onDrop('permanent_client_error') (got ${drops3.filter((r) => r === 'permanent_client_error').length})`);
+      assert(dropLines.length === 1 && dropLines[0].includes('permanent_client_error=2'),
+        `W3: two final-4xx drops in one flush log ONE summary line, not one per event (got ${JSON.stringify(dropLines)})`);
+
+      warns.length = 0;
+      await dl3w.identify('' as any); await dl3w.identify('' as any); await dl3w.identify('' as any);
+      await dl3w.alias('' as any); await dl3w.alias('' as any);
+      await dl3w.group('u', '' as any); await dl3w.group('u', '' as any);
+      await dl3w.track({ event: '' } as any); await dl3w.track(null, '');
+      await dl3w.trackPurchase('u', { value: NaN }); await dl3w.trackPurchase('u', { value: NaN });
+      assert(warns.length === 5, `W3: 11 invalid calls of 5 kinds log 5 warnings, one per kind (got ${warns.length})`);
+      assert(drops3.filter((r) => r === 'validation_error').length === 11,
+        `W3: every invalid call still reaches onDrop('validation_error') (got ${drops3.filter((r) => r === 'validation_error').length})`);
+      await dl3w.close();
+
+      warns.length = 0;
+      const dl3d = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, debug: true });
+      await dl3d.identify('' as any); await dl3d.identify('' as any);
+      assert(warns.filter((w) => w.includes('identify() requires')).length === 2,
+        'W3: with debug: true every occurrence is still logged');
+      await dl3d.close();
+    } finally {
+      console.warn = origWarn;
+    }
+  }
 
   console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
   process.exit(failures === 0 ? 0 : 1);

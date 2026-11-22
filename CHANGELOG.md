@@ -40,11 +40,23 @@ instead of `void` (see Changed).
   - added: `N event(s) dropped since the last report (<reason>=<n>, ...); getStats() has the totals.` (at most once per flush cycle)
   - added: `flush(): N event(s) not delivered yet; kept in memory and retried later.`
   - changed: `close(): N event(s) undelivered after ~Xms (budget Yms)` now ends with `: Q queued, F still in flight.` and counts in-flight events
+- Warnings for calls dropped because of invalid `track()`/`identify()`/`alias()`/`group()`/`trackPurchase()`
+  arguments are logged once per client for each kind, then only with `debug: true`. `onDrop` still
+  fires for every dropped call. Events dropped while sending are reported by the `N event(s) dropped since the last report` line.
+- All clients share one process `beforeExit` listener (it was one per client, which triggered
+  `MaxListenersExceededWarning` when a client was created per request). Each live client is
+  still flushed once on exit; the listener is removed when the last client is closed.
+- The API key prefix warning accepts `sk_` keys as well as `dk_`.
+- `examples/stripe-webhook.js` no longer uses the Stripe customer id as `userId`. DATALYR
+  links Stripe customers only through its own Stripe connection.
+- `page()` no longer copies the page `name` into `properties.url` when no url is passed.
+  Pass `properties.url` to record the page URL.
 
 ### Added
 - `getStats()`: queued, in-flight and dropped counts, by drop reason.
 - `flushTimeout` and `maxRetryDuration` options.
 - Drop reason `auth_refused`.
+- `trackPurchase()` options accept `externalIds` (same as `track()`), sent only when passed.
 
 ## [1.3.4] - 2026-11-14
 
@@ -175,17 +187,42 @@ instead of `void` (see Changed).
 - "Batching" is a 10-wide concurrency window, not a single batched HTTP request (one POST
   per event); the `/batch` endpoint is not used.
 
-## [1.2.1] - 2025-01
+## [1.2.3] - 2026-03-20
+
+(entry added later)
+
+### Added
+- `eventId` (a UUID) on every event, so the ingest server can de-duplicate.
+- `User-Agent: @datalyr/api/<version>` header on every request.
+- `alias()` for linking identities (`$alias` events).
+
+### Fixed
+- `identify()` sends traits as flat properties instead of wrapping them in `$set`.
+- `group()` sends traits as flat properties instead of nesting them under `traits`.
+
+## [1.2.2] - 2026-03-20
+
+(entry added later)
+
+### Fixed
+- Events are sent to `https://ingest.datalyr.com/track` instead of `api.datalyr.com`,
+  which did not record them.
+- `SDK_VERSION` constant matches the package version.
+
+### Changed
+- README rewritten with the full API reference.
+
+## [1.2.1] - 2026-01-01
 
 ### Changed
 - Complete README rewrite to match iOS/React Native/Web SDK documentation style
 
-## [1.2.0] - 2025-01
+## [1.2.0] - 2026-01-01
 
 ### Changed
 - Version bump for ecosystem consistency across all Datalyr SDKs
 
-## [1.1.0] - 2025-01
+## [1.1.0] - 2025-09-04
 
 ### Added
 - Anonymous ID support for complete user journey tracking
@@ -196,6 +233,22 @@ instead of `void` (see Changed).
 ### Changed
 - track() now supports both legacy (userId, event, properties) and new object signature
 - identify() now supports both legacy and new object signature with anonymousId
+
+## [1.0.4] - 2025-08-19
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.3] - 2025-08-19
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.2] - 2025-08-18
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.1] - 2025-08-18
+
+(entry added later) Published to npm; no source history was kept for this version.
 
 ## [1.0.0] - 2024-12
 

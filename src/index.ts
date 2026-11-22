@@ -66,14 +66,13 @@ export interface TrackOptions {
    *  `event.created`). Defaults to now. Invalid values are ignored (defaults to now) —
    *  pass this on delayed webhook replays so the event lands on the right day. */
   timestamp?: string | Date | number;
-  /** Declared external identity namespaces (Datalyr person contract ):
-   *  `{ namespace: id }`, e.g. `{ stripe: 'cus_123', crm: 'acct_9' }`. Use this for
-   *  ANY identifier that is not the same userId your client-side identify() uses —
-   *  internal database ids, provider customer ids, private namespaces. Declared ids
-   *  join the customer journey the moment the same namespace value is bound to an
-   *  account identifier from any producer. Do NOT put private ids in `userId` or
-   *  `anonymousId` — they cannot join there and the workspace health surface will
-   *  flag them as an unjoined namespace. */
+  /** Identifiers from other systems: `{ namespace: id }`, e.g. `{ firebase: 'uid_42' }`.
+   *  Never put another system's id in `userId` or `anonymousId`.
+   *  From this SDK, `firebase` joins a user when the same value is bound to that user,
+   *  and `klaviyo` joins after DATALYR's Klaviyo checks. Provider namespaces (`stripe`,
+   *  `shopify`, `whop`, `revenuecat`, `superwall` and the other connected sources) and
+   *  any other namespace are stored on the event but join no one: only the provider's
+   *  own connection in DATALYR links its ids. */
   externalIds?: Record<string, string>;
 }
 
@@ -201,13 +200,20 @@ export class Datalyr {
   private warnedNoId = false;            // one-time warn for calls with neither userId nor anonymousId
   private warnedClosed = false;          // one-time loud error for track() after close()
   private warnedAuthFailure = false;     // one-time loud error for 401/403
+  private warnedKinds = new Set<string>(); // warnings already logged once on this instance (see warnOnce)
   private retryState = new WeakMap<TrackEvent, RetryState>(); // per-event retry clock; WeakMap → no payload pollution
   private inFlight = 0;                  // events taken from the queue by a pass and not settled yet
   private nextSeq = 0;                   // arrival order, so the cap always evicts the oldest
   private seqOf = new WeakMap<TrackEvent, number>();
   private droppedByReason: Record<DropReason, number> = Object.fromEntries(ALL_DROP_REASONS.map((r) => [r, 0])) as Record<DropReason, number>;
   private reportedByReason: Record<DropReason, number> = Object.fromEntries(ALL_DROP_REASONS.map((r) => [r, 0])) as Record<DropReason, number>;
-  private exitHook?: () => void;         // the beforeExit listener (stored so close() can remove it — review M2)
+  private exitFlushed = false;           // the process-exit flush already ran for this client (once, like the old process.once)
+  // ONE process-level beforeExit listener shared by every live client. One listener per
+  // instance made apps that build a client per request hit MaxListenersExceededWarning and
+  // pinned every instance. A plain Set is enough: an unclosed client is already held by its
+  // flush timer, and close() removes it here (and the listener when the last client closes).
+  private static liveClients = new Set<Datalyr>();
+  private static exitListener?: () => void;
   private onError?: (event: TrackEvent, error: Error) => void; // 
   private onDrop?: (events: TrackEvent[], reason: DropReason) => void; // 
 
@@ -244,8 +250,8 @@ export class Datalyr {
       throw new Error('Datalyr API key is required');
     }
 
-    if (!this.apiKey.startsWith('dk_')) {
-      console.warn('[Datalyr] API key should start with "dk_"');
+    if (!this.apiKey.startsWith('dk_') && !this.apiKey.startsWith('sk_')) {
+      console.warn('[Datalyr] API key should start with "dk_" or "sk_"');
     }
 
     // Validate config values
@@ -281,16 +287,37 @@ export class Datalyr {
   }
 
   private registerExitHook(): void {
-    if (typeof process === 'undefined' || typeof process.once !== 'function') return;
-    // Stored on the instance so close() can removeListener it (review M2: `once` without
-    // removal leaks the instance + its queue for the process lifetime when close() is
-    // called and the hook never fires — bad for per-request client construction).
-    this.exitHook = () => {
-      if (this.isClosing || this.queue.length === 0) return;
-      // beforeExit lets the loop run async work; best-effort (use close() for guarantees).
-      this.startDrain()?.catch(() => {});
-    };
-    process.once('beforeExit', this.exitHook);
+    if (typeof process === 'undefined' || typeof process.on !== 'function') return;
+    Datalyr.liveClients.add(this);
+    if (!Datalyr.exitListener) {
+      Datalyr.exitListener = () => Datalyr.flushAllOnExit();
+      process.on('beforeExit', Datalyr.exitListener);
+    }
+  }
+
+  // beforeExit lets the loop run async work; best-effort (use close() for guarantees). Each
+  // client is flushed at most once here, as with the old per-instance process.once, so a
+  // down endpoint cannot keep re-triggering beforeExit and hold the process open.
+  private static flushAllOnExit(): void {
+    for (const client of [...Datalyr.liveClients]) {
+      if (client.exitFlushed) continue;
+      client.exitFlushed = true;
+      Datalyr.liveClients.delete(client);
+      if (client.isClosing || client.queue.length === 0) continue;
+      client.startDrain()?.catch(() => {});
+    }
+    if (Datalyr.liveClients.size === 0) Datalyr.removeExitListener();
+  }
+
+  private unregisterExitHook(): void {
+    Datalyr.liveClients.delete(this);
+    if (Datalyr.liveClients.size === 0) Datalyr.removeExitListener();
+  }
+
+  private static removeExitListener(): void {
+    if (!Datalyr.exitListener) return;
+    try { process.removeListener('beforeExit', Datalyr.exitListener); } catch { /* noop */ }
+    Datalyr.exitListener = undefined;
   }
 
   // fan a drop/error out to the caller's observability hook. A hook that throws must
@@ -299,6 +326,19 @@ export class Datalyr {
     this.droppedByReason[reason] += events.length; // every drop is counted, hook or not
     if (!this.onDrop) return;
     try { this.onDrop(events, reason); } catch { /* a hook must never break the SDK */ }
+  }
+
+  // Log a warning the first time each kind happens on this instance; repeats are logged
+  // only with `debug: true`. Per-event warnings used to print on EVERY dropped event and
+  // ignore `debug`, flooding logs under a bad integration or an outage. onDrop/onError
+  // still fire for every event, so nothing is lost to callers who need the full count.
+  private warnOnce(kind: string, message: string): void {
+    if (this.warnedKinds.has(kind)) {
+      if (this.debug) console.warn(message);
+      return;
+    }
+    this.warnedKinds.add(kind);
+    console.warn(message + ' (Logged once; set debug: true to log every occurrence.)');
   }
 
   private notifyError(event: TrackEvent, error: Error): void {
@@ -339,7 +379,7 @@ export class Datalyr {
     // throw out of this fire-and-forget promise → an ERR_UNHANDLED_REJECTION that crashed
     // the host process (exit 1). Warn, hand it to onDrop, and resolve.
     if (!eventName || typeof eventName !== 'string') {
-      console.warn('[Datalyr] track() requires a non-empty string event name; event dropped.');
+      this.warnOnce('track_event_name', '[Datalyr] track() requires a non-empty string event name; event dropped.');
       this.notifyDrop([{ event: String(eventName ?? ''), userId } as TrackEvent], 'validation_error');
       return;
     }
@@ -404,7 +444,7 @@ export class Datalyr {
   async identify(userId: string, traits?: any, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw (see track()).
     if (!userId) {
-      console.warn('[Datalyr] identify() requires a userId; call dropped.');
+      this.warnOnce('identify_user_id', '[Datalyr] identify() requires a userId; call dropped.');
       this.notifyDrop([{ event: '$identify' } as TrackEvent], 'validation_error');
       return;
     }
@@ -417,7 +457,7 @@ export class Datalyr {
   async alias(newUserId: string, previousId?: string, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw.
     if (!newUserId) {
-      console.warn('[Datalyr] alias() requires a newUserId; call dropped.');
+      this.warnOnce('alias_user_id', '[Datalyr] alias() requires a newUserId; call dropped.');
       this.notifyDrop([{ event: '$alias' } as TrackEvent], 'validation_error');
       return;
     }
@@ -437,11 +477,10 @@ export class Datalyr {
   }
 
   async page(userId: string, name?: string, properties?: any, anonymousId?: string): Promise<void> {
+    // `name` goes in properties.name only. It used to be copied into properties.url when no
+    // url was passed, which recorded a page name (e.g. "Pricing") as the page URL. Pass
+    // `properties.url` for the real URL.
     const props: Record<string, any> = { name, ...properties };
-    // P3: ingest derives page_url ONLY from props.url, so a name-only page() call left
-    // page_url blank server-side. When the caller gives no url, fall back to the page name
-    // so the pageview is at least addressable (callers who want a real URL should pass one).
-    if (props.url == null && name != null) props.url = name;
     return this.track({ userId: userId || undefined, anonymousId, event: '$pageview', properties: props });
   }
 
@@ -454,7 +493,7 @@ export class Datalyr {
   async group(userId: string, groupId: string, traits?: any, anonymousId?: string): Promise<void> {
     // warn-and-drop, never throw.
     if (!groupId) {
-      console.warn('[Datalyr] group() requires a groupId; call dropped.');
+      this.warnOnce('group_id', '[Datalyr] group() requires a groupId; call dropped.');
       this.notifyDrop([{ event: '$group', userId } as TrackEvent], 'validation_error');
       return;
     }
@@ -466,17 +505,24 @@ export class Datalyr {
    * reads `value ?? revenue ?? amount` (in that order) — `value` is the canonical field —
    * so this stamps `value` and (defensively) requires it to be a FINITE number. A NaN /
    * Infinity / non-number value would land as $0 or corrupt revenue rollups, so it is
-   * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency) and
-   * timestamp (backdating) exactly like track().
+   * warned-and-dropped rather than sent. `opts` forwards eventId (webhook idempotency),
+   * timestamp (backdating) and externalIds (see TrackEvent.externalIds)
+   * exactly like track(); externalIds is sent only when passed.
    */
   async trackPurchase(
     userId: string | null,
     purchase: PurchaseProperties,
-    opts?: { anonymousId?: string; eventId?: string; timestamp?: string | Date | number }
+    opts?: {
+      anonymousId?: string;
+      eventId?: string;
+      timestamp?: string | Date | number;
+      /** Same as track()'s `externalIds` (see TrackEvent.externalIds for which namespaces join a user). */
+      externalIds?: Record<string, string>;
+    }
   ): Promise<void> {
     const value = purchase?.value;
     if (typeof value !== 'number' || !Number.isFinite(value)) {
-      console.warn('[Datalyr] trackPurchase() requires a finite numeric `value` (revenue amount); event dropped.');
+      this.warnOnce('purchase_value', '[Datalyr] trackPurchase() requires a finite numeric `value` (revenue amount); event dropped.');
       this.notifyDrop([{ event: 'purchase', userId: userId || undefined } as TrackEvent], 'validation_error');
       return;
     }
@@ -486,6 +532,7 @@ export class Datalyr {
       event: 'purchase',
       eventId: opts?.eventId,
       timestamp: opts?.timestamp,
+      externalIds: opts?.externalIds,
       properties: { ...purchase, value, currency: (purchase.currency || 'USD').toUpperCase() }
     });
   }
@@ -950,11 +997,9 @@ export class Datalyr {
 
     this.closeFinished = true;
 
-    // review M2: stop leaking the beforeExit listener (+ the instance/queue it pins).
-    if (this.exitHook) {
-      try { process.removeListener('beforeExit', this.exitHook); } catch { /* noop */ }
-      this.exitHook = undefined;
-    }
+    // review M2: stop pinning this client (+ its queue) from the shared beforeExit
+    // listener; the listener itself goes when the last live client closes.
+    this.unregisterExitHook();
 
     this.reportDrops();
     const unsent = this.pendingCount();

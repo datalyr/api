@@ -6,6 +6,11 @@
 // redelivered purchase is counted once instead of double-counting revenue.
 // Also pass `timestamp: event.created` (epoch seconds) so delayed replays land on the
 // day the event actually happened, not the day the retry arrived.
+//
+// IDENTITY: `userId` is YOUR app's user id (the one your client-side identify() uses).
+// Never put the Stripe customer id there. DATALYR links Stripe customers to users through
+// its own Stripe connection; a `stripe` id sent from this SDK is stored on the event but
+// does not link anyone. Keep it in properties if you want to see it on the event.
 const express = require('express');
 const { Datalyr } = require('@datalyr/api');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -44,7 +49,7 @@ app.post('/webhooks/stripe',
         // dropped rather than counted as $0. eventId makes redeliveries idempotent (no
         // double-counted revenue); timestamp backdates delayed replays.
         await datalyr.trackPurchase(
-          session.client_reference_id || session.customer,
+          session.client_reference_id || null,
           {
             value: session.amount_total / 100,
             currency: session.currency,
@@ -52,7 +57,10 @@ app.post('/webhooks/stripe',
             stripeSessionId: session.id,
             customerEmail: session.customer_details?.email
           },
-          { eventId: event.id, timestamp: event.created }
+          {
+            eventId: event.id,
+            timestamp: event.created
+          }
         );
         break;
 
@@ -61,7 +69,7 @@ app.post('/webhooks/stripe',
 
         // Track subscription start
         await datalyr.track({
-          userId: subscription.metadata?.userId || subscription.customer,
+          userId: subscription.metadata?.userId,
           event: 'subscription_started',
           eventId: event.id,
           timestamp: event.created,
@@ -74,15 +82,17 @@ app.post('/webhooks/stripe',
           }
         });
 
-        // Update user traits
-        await datalyr.identify(
-          subscription.metadata?.userId || subscription.customer,
-          {
-            subscriptionStatus: 'active',
-            subscriptionPlan: subscription.items.data[0].price.nickname,
-            stripeCustomerId: subscription.customer
-          }
-        );
+        // Update user traits (only when you know your own user id)
+        if (subscription.metadata?.userId) {
+          await datalyr.identify(
+            subscription.metadata.userId,
+            {
+              subscriptionStatus: 'active',
+              subscriptionPlan: subscription.items.data[0].price.nickname,
+              stripeCustomerId: subscription.customer
+            }
+          );
+        }
         break;
 
       case 'customer.subscription.deleted':
@@ -90,7 +100,7 @@ app.post('/webhooks/stripe',
 
         // Track cancellation
         await datalyr.track({
-          userId: canceledSub.metadata?.userId || canceledSub.customer,
+          userId: canceledSub.metadata?.userId,
           event: 'subscription_canceled',
           eventId: event.id,
           timestamp: event.created,
@@ -101,14 +111,16 @@ app.post('/webhooks/stripe',
           }
         });
 
-        // Update user traits
-        await datalyr.identify(
-          canceledSub.metadata?.userId || canceledSub.customer,
-          {
-            subscriptionStatus: 'canceled',
-            subscriptionEndDate: new Date(canceledSub.ended_at * 1000).toISOString()
-          }
-        );
+        // Update user traits (only when you know your own user id)
+        if (canceledSub.metadata?.userId) {
+          await datalyr.identify(
+            canceledSub.metadata.userId,
+            {
+              subscriptionStatus: 'canceled',
+              subscriptionEndDate: new Date(canceledSub.ended_at * 1000).toISOString()
+            }
+          );
+        }
         break;
 
       case 'invoice.payment_failed':
@@ -116,7 +128,7 @@ app.post('/webhooks/stripe',
 
         // Track failed payment
         await datalyr.track({
-          userId: invoice.metadata?.userId || invoice.customer,
+          userId: invoice.metadata?.userId,
           event: 'payment_failed',
           eventId: event.id,
           timestamp: event.created,

@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`import Datalyr from '@datalyr/api'` threw "Datalyr is not a constructor" in Node ESM.** With no `exports` map, Node loaded the CommonJS build for `import`, so the default import was the whole module object. An `exports` map now sends `import` to `dist/index.mjs` (types `dist/index.d.mts`) and `require` to `dist/index.js` (types `dist/index.d.ts`). `main`, `module` and `types` are unchanged, and deep imports under `dist/` still work.
+
 ## [1.3.4] - 2026-11-14
 
 ### Fixed

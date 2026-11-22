@@ -214,7 +214,7 @@ async function main() {
     '9.D.3: pre-close event delivered; post-close event dropped (not sent)');
   assert(drops93.includes('closed'), "9.D.3: post-close track() fires onDrop('closed')");
 
-  // ---- 9.D.8: permanent 401 → sent ONCE, immediate drop, no 10-cycle requeue ----
+  // ---- 9.D.8: final 401 → sent ONCE, immediate drop (FX-047: counted as auth_refused) ----
   let calls401 = 0; const drops401: string[] = [];
   // Count only THIS test's event — an earlier bounded-close test (dl4) may still be running a
   // best-effort background flush against the shared global fetch; filtering keeps the count clean.
@@ -225,8 +225,8 @@ async function main() {
   const dl401 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 3, closeTimeout: 2000, onDrop: (_e, r) => drops401.push(r) });
   await dl401.track({ userId: 'u', event: 'bad_key' });
   await dl401.flush();
-  assert(calls401 === 1, `9.D.8: permanent 401 sent exactly ONCE — no retry, no requeue (got ${calls401}; retry would be 4)`);
-  assert(drops401.includes('permanent_client_error'), "9.D.8: 401 fires onDrop('permanent_client_error')");
+  assert(calls401 === 1, `9.D.8: final 401 sent exactly ONCE — no retry, no requeue (got ${calls401}; retry would be 4)`);
+  assert(drops401.length === 1 && drops401[0] === 'auth_refused', `9.D.8 / FX-047: 401 fires onDrop('auth_refused') (got ${JSON.stringify(drops401)})`);
   await dl401.close();
   assert(calls401 === 1, `9.D.8: 401 event not re-queued across close() either — still ${calls401} POST`);
 
@@ -416,6 +416,7 @@ async function main() {
     assert(errsN.length === 1 && errsN[0].message === 'fetch failed', `W14: a throwing fetch reaches onError with its error (got ${errsN.map((e) => e.message)})`);
     assert(dropsN.length === 0 && sentN.length === 0, 'W14: a throwing fetch does not drop the event');
     failNet = false;
+    await new Promise((r) => setTimeout(r, 1100)); // FX-047: a failed event waits out its backoff (first one at most 1 s)
     await dlN.flush();
     assert(sentN.length === 1, 'W14: the event is re-queued and sent once the network recovers');
     await dlN.close();
@@ -439,25 +440,24 @@ async function main() {
   }
 
   // ---- W3: per-event warnings log once per instance (then only with debug); hooks still fire ----
+  // Send-side drops (here a final 400) are reported by FX-047's summary: ONE line per flush
+  // cycle, never one per event. Validation drops use warnOnce: one line per kind.
   {
     const warns: string[] = [];
     const origWarn = console.warn;
     console.warn = (...args: any[]) => { warns.push(args.map(String).join(' ')); };
     try {
-      let n3 = 0;
-      (globalThis as any).fetch = async (_u: string, opts: any) => {
-        if (JSON.parse(opts.body).event.startsWith('w3_')) n3++;
-        return { ok: false, status: 503, statusText: 'down', text: async () => '' };
-      };
+      (globalThis as any).fetch = async () => ({ ok: false, status: 400, statusText: 'bad request', text: async () => '' });
       const drops3: string[] = [];
       const dl3w = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0, closeTimeout: 1000, onDrop: (_e, r) => drops3.push(r) });
       await dl3w.track({ userId: 'u', event: 'w3_a' });
       await dl3w.track({ userId: 'u', event: 'w3_b' });
-      for (let i = 0; i < 10; i++) await dl3w.flush(); // each flush = one failed cycle per event
-      const maxWarns = warns.filter((w) => w.includes('failed flush attempts')).length;
-      assert(drops3.filter((r) => r === 'max_flush_attempts').length === 2,
-        `W3: both events still reach onDrop('max_flush_attempts') (got ${drops3.filter((r) => r === 'max_flush_attempts').length})`);
-      assert(maxWarns === 1, `W3: max-attempts drop warned ONCE per instance, not per event (got ${maxWarns})`);
+      await dl3w.flush();
+      const dropLines = warns.filter((w) => w.includes('dropped since the last report'));
+      assert(drops3.filter((r) => r === 'permanent_client_error').length === 2,
+        `W3: both events still reach onDrop('permanent_client_error') (got ${drops3.filter((r) => r === 'permanent_client_error').length})`);
+      assert(dropLines.length === 1 && dropLines[0].includes('permanent_client_error=2'),
+        `W3: two final-4xx drops in one flush log ONE summary line, not one per event (got ${JSON.stringify(dropLines)})`);
 
       warns.length = 0;
       await dl3w.identify('' as any); await dl3w.identify('' as any); await dl3w.identify('' as any);

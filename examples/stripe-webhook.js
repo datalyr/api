@@ -8,8 +8,9 @@
 // day the event actually happened, not the day the retry arrived.
 //
 // IDENTITY: `userId` is YOUR app's user id (the one your client-side identify() uses).
-// Never put the Stripe customer id there. Send it as `externalIds: { stripe: <customer id> }`;
-// DATALYR joins it to the customer journey once that Stripe customer is linked to a user.
+// Never put the Stripe customer id there. DATALYR links Stripe customers to users through
+// its own Stripe connection; a `stripe` id sent from this SDK is stored on the event but
+// does not link anyone. Keep it in properties if you want to see it on the event.
 const express = require('express');
 const { Datalyr } = require('@datalyr/api');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -58,9 +59,7 @@ app.post('/webhooks/stripe',
           },
           {
             eventId: event.id,
-            timestamp: event.created,
-            // guest checkouts have no Stripe customer
-            externalIds: session.customer ? { stripe: session.customer } : undefined
+            timestamp: event.created
           }
         );
         break;
@@ -71,7 +70,6 @@ app.post('/webhooks/stripe',
         // Track subscription start
         await datalyr.track({
           userId: subscription.metadata?.userId,
-          externalIds: { stripe: subscription.customer },
           event: 'subscription_started',
           eventId: event.id,
           timestamp: event.created,
@@ -103,7 +101,6 @@ app.post('/webhooks/stripe',
         // Track cancellation
         await datalyr.track({
           userId: canceledSub.metadata?.userId,
-          externalIds: { stripe: canceledSub.customer },
           event: 'subscription_canceled',
           eventId: event.id,
           timestamp: event.created,
@@ -132,7 +129,6 @@ app.post('/webhooks/stripe',
         // Track failed payment
         await datalyr.track({
           userId: invoice.metadata?.userId,
-          externalIds: { stripe: invoice.customer },
           event: 'payment_failed',
           eventId: event.id,
           timestamp: event.created,

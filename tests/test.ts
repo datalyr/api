@@ -1,5 +1,6 @@
 // Functional tests for the Node SDK. Mocks global fetch (no real network) and asserts
 // the 1.2.4 fixes. Run with: node tests/test.ts  (Node 23+ strips types).
+import { readFileSync } from 'node:fs';
 import { Datalyr } from '../src/index.ts';
 
 let failures = 0;
@@ -345,6 +346,87 @@ async function main() {
   await new Promise((r) => setTimeout(r, 1000)); // let the late 503 land
   assert(drops8c.length === 1 && drops8c[0] === 'close_timeout',
     `DLR-8: a late transient failure after close() fires onDrop('close_timeout') instead of stranding (got ${JSON.stringify(drops8c)})`);
+
+  // ---- W14: page(), group(), externalIds, context shape, SDK version ----
+  {
+    const sentW: any[] = [];
+    const headersW: any[] = [];
+    (globalThis as any).fetch = async (_url: string, opts: any) => {
+      sentW.push(JSON.parse(opts.body));
+      headersW.push(opts.headers);
+      return { ok: true, status: 200, statusText: 'OK', text: async () => '', json: async () => ({}) };
+    };
+    const dlW = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000 });
+    await dlW.page('u_page', 'Pricing', { url: 'https://example.com/pricing', plan: 'pro' }, 'anon_page');
+    await dlW.group('u_group', 'org_1', { name: 'Org One', seats: 5 });
+    await dlW.track({ userId: 'u_ext', event: 'ext_on', externalIds: { stripe: 'cus_123', crm: 'acct_9' } });
+    await dlW.track({ userId: 'u_ext', event: 'ext_off' });
+    await dlW.flush();
+    const w = (n: string) => sentW.find((e) => e.event === n);
+
+    const pv = w('$pageview');
+    assert(!!pv && pv.userId === 'u_page' && pv.anonymousId === 'anon_page' && pv.properties.name === 'Pricing' &&
+      pv.properties.url === 'https://example.com/pricing' && pv.properties.plan === 'pro',
+      'W14: page() sends $pageview with userId, anonymousId, name, the given url and extra properties');
+
+    const grp = w('$group');
+    assert(!!grp && grp.userId === 'u_group' && grp.properties.groupId === 'org_1' &&
+      grp.properties.name === 'Org One' && grp.properties.seats === 5,
+      'W14: group() sends $group with userId, groupId and the traits');
+
+    assert(JSON.stringify(w('ext_on').externalIds) === JSON.stringify({ stripe: 'cus_123', crm: 'acct_9' }),
+      'W14: track() externalIds ride the envelope top-level, unchanged');
+    assert(!('externalIds' in w('ext_off')), 'W14: no externalIds key when none passed');
+
+    const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+    assert(JSON.stringify(w('ext_off').context) === JSON.stringify({ library: '@datalyr/api', version: pkgVersion, source: 'api', schema_version: 1 }),
+      `W14: context is exactly { library, version, source: 'api', schema_version: 1 } (got ${JSON.stringify(w('ext_off').context)})`);
+    assert(w('ext_off').context.version === pkgVersion,
+      `W14: SDK_VERSION (${w('ext_off').context.version}) equals package.json version (${pkgVersion})`);
+    assert(headersW[0]['User-Agent'] === `@datalyr/api/${pkgVersion}`, 'W14: User-Agent carries the package.json version');
+    await dlW.close();
+  }
+
+  // ---- W14: a fetch that throws is transient (onError, re-queued, sent on the next flush) ----
+  {
+    let failNet = true;
+    const sentN: any[] = [];
+    (globalThis as any).fetch = async (_url: string, opts: any) => {
+      const body = JSON.parse(opts.body);
+      if (body.event !== 'net_fail') return { ok: true, status: 200, statusText: 'OK', text: async () => '' };
+      if (failNet) throw new TypeError('fetch failed');
+      sentN.push(body);
+      return { ok: true, status: 200, statusText: 'OK', text: async () => '', json: async () => ({}) };
+    };
+    const errsN: Error[] = []; const dropsN: string[] = [];
+    const dlN = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0,
+      onError: (_e, err) => errsN.push(err), onDrop: (_e, r) => dropsN.push(r) });
+    await dlN.track({ userId: 'u', event: 'net_fail' });
+    await dlN.flush();
+    assert(errsN.length === 1 && errsN[0].message === 'fetch failed', `W14: a throwing fetch reaches onError with its error (got ${errsN.map((e) => e.message)})`);
+    assert(dropsN.length === 0 && sentN.length === 0, 'W14: a throwing fetch does not drop the event');
+    failNet = false;
+    await dlN.flush();
+    assert(sentN.length === 1, 'W14: the event is re-queued and sent once the network recovers');
+    await dlN.close();
+  }
+
+  // ---- W14: a fetch that never answers is aborted after `timeout` ms ----
+  {
+    (globalThis as any).fetch = (_url: string, opts: any) => new Promise((_res, rej) => {
+      opts.signal.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    });
+    const errsT: Error[] = [];
+    const dlT = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 0, timeout: 1000, closeTimeout: 1000,
+      onError: (_e, err) => errsT.push(err) });
+    await dlT.track({ userId: 'u', event: 'hangs' });
+    const tT = Date.now();
+    await dlT.flush();
+    const elT = Date.now() - tT;
+    assert(errsT.length === 1 && errsT[0].name === 'AbortError', `W14: a hung request is aborted and reaches onError (got ${errsT.map((e) => e.name)})`);
+    assert(elT >= 900 && elT < 3000, `W14: the abort fires at the configured timeout (~1000ms, took ${elT}ms)`);
+    await dlT.close();
+  }
 
   // ---- W3: per-event warnings log once per instance (then only with debug); hooks still fire ----
   {

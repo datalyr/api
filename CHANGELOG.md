@@ -4,9 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+Release as **1.4.0**, not a patch: `flush()` and `close()` now resolve with `{ unsent }`
+instead of `void` (see Changed).
+
 ### Fixed
+- **Events were deleted during a server outage.** An event that failed with a temporary
+  error (`5xx`, `503`, `429`, `408`, a timeout or a network error) was dropped after 10
+  failed flush cycles, about two minutes at the default settings. It is now kept and
+  retried for `maxRetryDuration` (new, default 1 hour), with backoff of up to 60 s between
+  cycles. Every retry carries the same `eventId`, and an event the server accepted (`2xx`)
+  is never sent again.
+- **`Retry-After` was ignored.** The server answers `503` and `429` with `Retry-After`; the
+  SDK now waits at least that long plus up to 20% jitter (seconds or an HTTP date, capped at
+  5 minutes), so clients do not all retry at the same instant.
+- **`flush()` had no time bound** and could wait through every retry of every event. It now
+  waits at most `flushTimeout` (new, default 30 s).
 - **`import Datalyr from '@datalyr/api'` threw "Datalyr is not a constructor" in Node ESM.** With no `exports` map, Node loaded the CommonJS build for `import`, so the default import was the whole module object. An `exports` map now sends `import` to `dist/index.mjs` (types `dist/index.d.mts`) and `require` to `dist/index.js` (types `dist/index.d.ts`). `main`, `module` and `types` are unchanged, and deep imports under `dist/` still work.
 - **Release as a minor version (1.4.0).** Two narrow cases change: an ESM workaround for the old bug (`new Datalyr.default()`, `Datalyr.Datalyr`, `(await import('@datalyr/api')).default.default`) no longer works, because the default import is now the class; use `import Datalyr from '@datalyr/api'` or `import { Datalyr } from '@datalyr/api'`. A deep import without a file extension (`@datalyr/api/dist/index`) no longer resolves; add `.js` or `.mjs`.
+
+### Changed
+- **Breaking for typed code:** `flush()` and `close()` return `Promise<FlushResult>`
+  (`{ unsent: number }`) instead of `Promise<void>`. Code that ignores the value is
+  unaffected; a subclass that overrides `flush(): Promise<void>` or code annotated to
+  expect `Promise<void>` from them no longer type-checks.
+- `maxQueueSize` now counts queued plus in-flight events, including those waiting to be
+  retried, so memory stays bounded through an outage. When every held event is in flight,
+  a new event is the one dropped (`queue_overflow`).
+- `401`/`403` are still final, but reach `onDrop` with the new reason `auth_refused`
+  instead of `permanent_client_error`.
+- `max_flush_attempts` now means "temporary failures lasted longer than
+  `maxRetryDuration`", not "10 failed flush cycles".
+- Log lines:
+  - removed: `Queue full (N) — dropping oldest events. ...` (once, on first overflow)
+  - removed: `Dropping event after N failed flush attempts: <event>` (once per event)
+  - added: `N event(s) dropped since the last report (<reason>=<n>, ...); getStats() has the totals.` (at most once per flush cycle)
+  - added: `flush(): N event(s) not delivered yet; kept in memory and retried later.`
+  - changed: `close(): N event(s) undelivered after ~Xms (budget Yms)` now ends with `: Q queued, F still in flight.` and counts in-flight events
+
+### Added
+- `getStats()`: queued, in-flight and dropped counts, by drop reason.
+- `flushTimeout` and `maxRetryDuration` options.
+- Drop reason `auth_refused`.
 
 ## [1.3.4] - 2026-11-14
 

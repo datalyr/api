@@ -22,7 +22,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --clean",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
-    "test": "node tests/test.ts",
+    "test": "node tests/test.ts && node tests/retry.ts",
     "prepublishOnly": "npm run build"
   },
   "files": [

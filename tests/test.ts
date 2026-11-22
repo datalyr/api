@@ -169,7 +169,7 @@ async function main() {
     '9.D.3: pre-close event delivered; post-close event dropped (not sent)');
   assert(drops93.includes('closed'), "9.D.3: post-close track() fires onDrop('closed')");
 
-  // ---- 9.D.8: permanent 401 → sent ONCE, immediate drop, no 10-cycle requeue ----
+  // ---- 9.D.8: final 401 → sent ONCE, immediate drop (FX-047: counted as auth_refused) ----
   let calls401 = 0; const drops401: string[] = [];
   // Count only THIS test's event — an earlier bounded-close test (dl4) may still be running a
   // best-effort background flush against the shared global fetch; filtering keeps the count clean.
@@ -180,8 +180,8 @@ async function main() {
   const dl401 = new Datalyr({ apiKey: 'dk_test', flushAt: 100, flushInterval: 3_600_000, retryLimit: 3, closeTimeout: 2000, onDrop: (_e, r) => drops401.push(r) });
   await dl401.track({ userId: 'u', event: 'bad_key' });
   await dl401.flush();
-  assert(calls401 === 1, `9.D.8: permanent 401 sent exactly ONCE — no retry, no requeue (got ${calls401}; retry would be 4)`);
-  assert(drops401.includes('permanent_client_error'), "9.D.8: 401 fires onDrop('permanent_client_error')");
+  assert(calls401 === 1, `9.D.8: final 401 sent exactly ONCE — no retry, no requeue (got ${calls401}; retry would be 4)`);
+  assert(drops401.length === 1 && drops401[0] === 'auth_refused', `9.D.8 / FX-047: 401 fires onDrop('auth_refused') (got ${JSON.stringify(drops401)})`);
   await dl401.close();
   assert(calls401 === 1, `9.D.8: 401 event not re-queued across close() either — still ${calls401} POST`);
 

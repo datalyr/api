@@ -1,11 +1,11 @@
-// Express.js integration example for @datalyr/api SDK
+// Express integration example for the DATALYR Node SDK (@datalyr/api)
 const express = require('express');
 const { Datalyr } = require('@datalyr/api');
 
 const app = express();
 app.use(express.json());
 
-// Initialize Datalyr SDK
+// Initialize the DATALYR SDK
 const datalyr = new Datalyr({
   apiKey: process.env.DATALYR_API_KEY || 'dk_your_api_key_here',
   debug: true
@@ -14,16 +14,16 @@ const datalyr = new Datalyr({
 // Middleware to track API requests
 app.use(async (req, res, next) => {
   // Track API request
-  await datalyr.track(
-    req.user?.id || null,
-    'API Request',
-    {
+  await datalyr.track({
+    event: 'api_request',
+    userId: req.user?.id,
+    properties: {
       method: req.method,
       path: req.path,
       ip: req.ip,
       userAgent: req.headers['user-agent']
     }
-  );
+  });
   next();
 });
 
@@ -33,9 +33,10 @@ app.post('/api/signup', async (req, res) => {
   const userId = `user_${Date.now()}`;
 
   // Track signup event
-  await datalyr.track(userId, 'User Signed Up', {
-    email,
-    source: 'api'
+  await datalyr.track({
+    event: 'signup_completed',
+    userId,
+    properties: { email, source: 'api' }
   });
 
   // Identify the new user
@@ -52,12 +53,11 @@ app.post('/api/signup', async (req, res) => {
 app.post('/api/purchase', async (req, res) => {
   const { userId, amount, products } = req.body;
 
-  // Track purchase event
-  await datalyr.track(userId, 'Purchase Completed', {
-    amount,
+  // Record the purchase with its value
+  await datalyr.trackPurchase(userId, {
+    value: amount,
     currency: 'USD',
-    products,
-    timestamp: new Date().toISOString()
+    products
   });
 
   res.json({ success: true });

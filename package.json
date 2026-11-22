@@ -1,7 +1,7 @@
 {
   "name": "@datalyr/api",
   "version": "1.3.4",
-  "description": "Datalyr API SDK for server-side tracking",
+  "description": "DATALYR Node SDK for server-side event, identity and revenue tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -26,7 +26,7 @@
   ],
   "author": "Datalyr",
   "license": "MIT",
-  "homepage": "https://datalyr.com",
+  "homepage": "https://docs.datalyr.com/sdk-reference/node",
   "repository": {
     "type": "git",
     "url": "https://github.com/datalyr/api.git"

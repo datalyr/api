@@ -64,7 +64,7 @@ instead of `void` (see Changed).
 ## [1.3.3] - 2026-09-03
 
 ### Added
-- `externalIds` on `track()` options (person contract §6): `{ namespace: id }` declared identities, e.g. `{ stripe: 'cus_123' }`, sent top-level on the envelope. Ingest classifies them as declared namespaces so they join the customer journey; undeclared namespaces are reported as unjoined rather than minting a person.
+- `externalIds` on `track()` options: `{ namespace: id }` declared identities, e.g. `{ stripe: 'cus_123' }`, sent top-level on the envelope. Ingest classifies them as declared namespaces so they join the customer journey; undeclared namespaces are reported as unjoined rather than minting a person.
 
 ### Fixed
 - The `SDK_VERSION` sent in `context.library.version` and the `User-Agent` was stuck at `1.3.1` through the 1.3.2 release; it now matches the package version.
@@ -72,7 +72,7 @@ instead of `void` (see Changed).
 ## [1.3.2] - 2026-07-25
 
 ### Changed
-- **NODE-01: `engines.node` raised to `>=18.0.0`.** The SDK calls global `fetch` and
+- **`engines.node` raised to `>=18.0.0`.** The SDK calls global `fetch` and
   `AbortController`; Node 16 and earlier provide neither and the SDK fails at the first
   send. `engines` nonetheless declared `>=14.17.0`, so npm installed it silently on
   runtimes that cannot run it and the failure surfaced at the first event instead of at
@@ -89,9 +89,9 @@ instead of `void` (see Changed).
 ## [1.3.1] - 2026-07-12
 
 ### Added
-- **A3-25: `schema_version` envelope stamp.** Every event's context now carries
+- **`schema_version` envelope stamp.** Every event's context now carries
   `schema_version: 1`, the first canonical envelope version shared across the SDK fleet,
-  so the ingest contract layer can key on one version marker.
+  so the server can key on one version marker.
 - **`eventId` on `TrackOptions` (webhook idempotency).** The ingest server de-duplicates
   on the event id (6h window), but `track()` always minted a fresh UUID — so at-least-once
   webhook redeliveries (Stripe, Shopify, …) were counted as new events, double-counting
@@ -112,26 +112,26 @@ instead of `void` (see Changed).
   exceptions are swallowed and can never crash the SDK.
 
 ### Fixed
-- **`close()` hung the process up to `closeTimeout` (~30s) after resolving (TR-09).** The
+- **`close()` hung the process up to `closeTimeout` (~30s) after resolving.** The
   drain loop's `Promise.race` budget/pause timers were never cleared, so a won race left a
   live timer pinning the event loop — reintroducing the exact exit-hang the 1.3.0 unref work
   fixed. Timers are now canceled when their race settles (proven: process exits ~4ms after
   `close()` instead of ~8s).
-- **`await flush()` did not guarantee a drain (TR-25).** If a flush was already in flight it
+- **`await flush()` did not guarantee a drain.** If a flush was already in flight it
   returned that promise, which had snapshotted the queue **before** later events — so the
   serverless `track(); track(); await flush()` pattern stranded the second event. `flush()`
   now loops until the queue empties (or a pass delivers nothing against a down endpoint).
-- **Invalid args threw out of a fire-and-forget promise (9.D.4).** `track({event:''})`,
+- **Invalid args threw out of a fire-and-forget promise.** `track({event:''})`,
   `identify()`/`alias()`/`group()` with a missing required id used to `throw`, which — for an
   un-awaited call — surfaced as an `ERR_UNHANDLED_REJECTION` and crashed the host (exit 1).
   They now warn-and-drop (`onDrop('validation_error')`) and resolve.
-- **A wrong API key black-holed everything silently (9.D.8).** A permanent 4xx (≠ 408/429)
+- **A wrong API key black-holed everything silently.** A permanent 4xx (≠ 408/429)
   was re-queued and retried ~10 flush cycles per event before a generic drop. It is now
   dropped immediately (no retry/requeue), and `401`/`403` logs a one-time authentication
   failure. `408`/`429` are now correctly treated as **transient** (retried), not permanent.
-- **`track()` after `close()` was silently dropped (9.D.3).** It now logs one loud error and
+- **`track()` after `close()` was silently dropped.** It now logs one loud error and
   fires `onDrop('closed')`; `close()` is idempotent under repeat/concurrent calls.
-- **Over-long `eventId` (B-4).** A pathological caller id became a pathological server Redis
+- **Over-long `eventId`.** A pathological caller id became a pathological server-side
   key; ids over 256 chars are now collapsed to a deterministic hash (redeliveries of the same
   id still dedup).
 - **`page(userId, name)` left `page_url` blank server-side** — the pageview now falls back to

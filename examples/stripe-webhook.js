@@ -1,9 +1,9 @@
-// Stripe webhook integration example for @datalyr/api SDK
+// Stripe webhook integration example for the DATALYR Node SDK (@datalyr/api)
 //
 // IDEMPOTENT REDELIVERY: Stripe delivers webhooks at-least-once — the same event can
 // arrive multiple times (retries, replays from the dashboard). Always pass the Stripe
-// event id as `eventId`: Datalyr's ingest de-duplicates on it (6h window), so a
-// redelivered Purchase is counted ONCE instead of double-counting revenue.
+// event id as `eventId`: DATALYR de-duplicates on it (6h window), so a
+// redelivered purchase is counted once instead of double-counting revenue.
 // Also pass `timestamp: event.created` (epoch seconds) so delayed replays land on the
 // day the event actually happened, not the day the retry arrived.
 const express = require('express');
@@ -62,7 +62,7 @@ app.post('/webhooks/stripe',
         // Track subscription start
         await datalyr.track({
           userId: subscription.metadata?.userId || subscription.customer,
-          event: 'Subscription Started',
+          event: 'subscription_started',
           eventId: event.id,
           timestamp: event.created,
           properties: {
@@ -91,7 +91,7 @@ app.post('/webhooks/stripe',
         // Track cancellation
         await datalyr.track({
           userId: canceledSub.metadata?.userId || canceledSub.customer,
-          event: 'Subscription Canceled',
+          event: 'subscription_canceled',
           eventId: event.id,
           timestamp: event.created,
           properties: {
@@ -117,7 +117,7 @@ app.post('/webhooks/stripe',
         // Track failed payment
         await datalyr.track({
           userId: invoice.metadata?.userId || invoice.customer,
-          event: 'Payment Failed',
+          event: 'payment_failed',
           eventId: event.id,
           timestamp: event.created,
           properties: {

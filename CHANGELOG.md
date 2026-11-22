@@ -144,17 +144,42 @@ All notable changes to this project will be documented in this file.
 - "Batching" is a 10-wide concurrency window, not a single batched HTTP request (one POST
   per event); the `/batch` endpoint is not used.
 
-## [1.2.1] - 2025-01
+## [1.2.3] - 2026-03-20
+
+(entry added later)
+
+### Added
+- `eventId` (a UUID) on every event, so the ingest server can de-duplicate.
+- `User-Agent: @datalyr/api/<version>` header on every request.
+- `alias()` for linking identities (`$alias` events).
+
+### Fixed
+- `identify()` sends traits as flat properties instead of wrapping them in `$set`.
+- `group()` sends traits as flat properties instead of nesting them under `traits`.
+
+## [1.2.2] - 2026-03-20
+
+(entry added later)
+
+### Fixed
+- Events are sent to `https://ingest.datalyr.com/track` instead of `api.datalyr.com`,
+  which did not record them.
+- `SDK_VERSION` constant matches the package version.
+
+### Changed
+- README rewritten with the full API reference.
+
+## [1.2.1] - 2026-01-01
 
 ### Changed
 - Complete README rewrite to match iOS/React Native/Web SDK documentation style
 
-## [1.2.0] - 2025-01
+## [1.2.0] - 2026-01-01
 
 ### Changed
 - Version bump for ecosystem consistency across all Datalyr SDKs
 
-## [1.1.0] - 2025-01
+## [1.1.0] - 2025-09-04
 
 ### Added
 - Anonymous ID support for complete user journey tracking
@@ -165,6 +190,22 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - track() now supports both legacy (userId, event, properties) and new object signature
 - identify() now supports both legacy and new object signature with anonymousId
+
+## [1.0.4] - 2025-08-19
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.3] - 2025-08-19
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.2] - 2025-08-18
+
+(entry added later) Published to npm; no source history was kept for this version.
+
+## [1.0.1] - 2025-08-18
+
+(entry added later) Published to npm; no source history was kept for this version.
 
 ## [1.0.0] - 2024-12
 

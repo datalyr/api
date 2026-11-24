@@ -116,7 +116,7 @@ function generateAnonymousId(): string {
   return 'anon_' + randomUUID();
 }
 
-const SDK_VERSION = '1.3.4'; // keep in sync with package.json
+const SDK_VERSION = '1.4.0'; // keep in sync with package.json
 
 // Hard cap on drain passes per flush (a producer that keeps enqueuing during a drain must
 // not keep one flush running forever).

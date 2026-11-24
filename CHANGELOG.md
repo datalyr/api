@@ -2,9 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.4.0]
 
-Release as **1.4.0**, not a patch: `flush()` and `close()` now resolve with `{ unsent }`
+Minor version, not a patch: `flush()` and `close()` now resolve with `{ unsent }`
 instead of `void` (see Changed).
 
 ### Fixed
@@ -20,7 +20,7 @@ instead of `void` (see Changed).
 - **`flush()` had no time bound** and could wait through every retry of every event. It now
   waits at most `flushTimeout` (new, default 30 s).
 - **`import Datalyr from '@datalyr/api'` threw "Datalyr is not a constructor" in Node ESM.** With no `exports` map, Node loaded the CommonJS build for `import`, so the default import was the whole module object. An `exports` map now sends `import` to `dist/index.mjs` (types `dist/index.d.mts`) and `require` to `dist/index.js` (types `dist/index.d.ts`). `main`, `module` and `types` are unchanged, and deep imports under `dist/` still work.
-- **Release as a minor version (1.4.0).** Two narrow cases change: an ESM workaround for the old bug (`new Datalyr.default()`, `Datalyr.Datalyr`, `(await import('@datalyr/api')).default.default`) no longer works, because the default import is now the class; use `import Datalyr from '@datalyr/api'` or `import { Datalyr } from '@datalyr/api'`. A deep import without a file extension (`@datalyr/api/dist/index`) no longer resolves; add `.js` or `.mjs`.
+- **Minor version.** Two narrow cases change: an ESM workaround for the old bug (`new Datalyr.default()`, `Datalyr.Datalyr`, `(await import('@datalyr/api')).default.default`) no longer works, because the default import is now the class; use `import Datalyr from '@datalyr/api'` or `import { Datalyr } from '@datalyr/api'`. A deep import without a file extension (`@datalyr/api/dist/index`) no longer resolves; add `.js` or `.mjs`.
 
 ### Changed
 - **Breaking for typed code:** `flush()` and `close()` return `Promise<FlushResult>`

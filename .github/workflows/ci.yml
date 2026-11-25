@@ -35,3 +35,25 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      # Package tarball for publishing off a laptop: `npm pack` (no prepack
+      # script, so it packs the dist/ built above) plus its sha256. Once per
+      # run (Node 24 leg), and not for fork PRs.
+      - name: Pack tarball and checksum
+        id: pack
+        if: matrix.node == 24 && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          mkdir -p pack-out
+          TARBALL="$(npm pack --pack-destination pack-out --silent | tail -n 1)"
+          (cd pack-out && sha256sum "$TARBALL" > SHA256SUMS.txt)
+          cat pack-out/SHA256SUMS.txt
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Upload package artifact
+        if: steps.pack.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: datalyr-api-${{ steps.pack.outputs.version }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: pack-out/
+          retention-days: 7
+          if-no-files-found: error
